@@ -38,13 +38,10 @@ python app/main.py
 
 ## Next Steps
 - Add indicator registry + hot-reload.
+- Chart interactions: mouse wheel zooms time scale; dragging on price axis adjusts price scale.
 
 ## SQLite Cache
 - Stored at `app/data/ohlcv.sqlite`.
 - Tables:
   - `ohlcv` (exchange, symbol, timeframe, ts_ms, open, high, low, close, volume)
   - `symbols` (exchange, symbol, fetched_at)
-
-## Notes
-- Chart interactions: mouse wheel zooms time scale; dragging on price axis adjusts price scale.
-- Renko is price-action based; timestamps are derived for plotting only.
