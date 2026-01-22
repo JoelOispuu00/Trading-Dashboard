@@ -36,8 +36,7 @@ python app/main.py
 - Load fetches recent bars for the selected symbol/timeframe, caches them, and renders.
 - Load More fetches older bars (backfill) and merges with cache.
 
-## Next Steps (Suggested)
-- Wire Renko chart rendering using the provided Renko logic.
+## Next Steps
 - Add indicator registry + hot-reload.
 
 ## SQLite Cache
