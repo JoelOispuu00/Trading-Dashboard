@@ -11,10 +11,6 @@
 - Local caching for OHLCV using SQLite with incremental fetch on startup (resume from last cached bar).
 - Lazy data loading: fetch a bounded recent window first (e.g., 2k-5k bars) so the chart is usable immediately, then extend on demand.
 
-## Non-goals (v1)
-- No replay mode.
-- No drawing tools.
-
 ## High-level design
 The app is a single desktop process with a clean split:
 - UI layer: PyQt6 widgets, chart rendering, user controls.
@@ -32,6 +28,7 @@ The data store supports explicit historical backfill: requesting older ranges th
 - Market scanner module.
 - Deep backtester (Backtrader or custom engine integration).
 - Strategy management (hot-reload Python strategies, parameter UI, execution logs).
+- Simple drawing tools, trendlines etc
 
 ## Folder structure
 - `app/main.py`: app entrypoint
