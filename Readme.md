@@ -11,7 +11,7 @@ Desktop charting app with TradingView-like dark theme, candlestick/Renko(TODO) c
 - Fetch, symbol list, and render errors surface in the error dock.
 - Symbol list loading is non-blocking.
 - Binance requests retry once on network failure.
-- Volume bars use a green tone.
+- Volume bars use a green tone. - in the future make volume bars candle colored
 
 ## Quick Start
 1) Create/activate your Python environment
