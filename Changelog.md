@@ -56,3 +56,8 @@
 - Added per-tab timeframe persistence.
 - Periodic time offset resync for countdown accuracy.
 - Added chart crosshair cursor with dashed guides.
+
+## 0.4.1
+- Added a Window menu to re-open hidden docks.
+- Added a Settings menu with a placeholder dialog.
+- Added a Themes submenu with a placeholder dialog.

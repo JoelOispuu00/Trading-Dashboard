@@ -2,6 +2,37 @@ QMainWindow {
     background-color: #131722;
 }
 
+QMenuBar {
+    background-color: #1E222D;
+    color: #B2B5BE;
+    border-bottom: 1px solid #2A2E39;
+}
+
+QMenuBar::item {
+    background: transparent;
+    padding: 4px 10px;
+}
+
+QMenuBar::item:selected {
+    background: #0F141E;
+    color: #FFFFFF;
+}
+
+QMenu {
+    background-color: #0F141E;
+    color: #B2B5BE;
+    border: 1px solid #2A2E39;
+}
+
+QMenu::item {
+    padding: 4px 16px;
+}
+
+QMenu::item:selected {
+    background-color: #2962FF;
+    color: #FFFFFF;
+}
+
 QDockWidget {
     titlebar-close-icon: url(none);
     titlebar-normal-icon: url(none);

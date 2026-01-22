@@ -21,6 +21,9 @@ Desktop charting app with TradingView-like dark theme, candlestick/Renko(TODO) c
 - Symbol tabs above the chart support quick switching, adding via "+", and persistence.
 - Each symbol tab stores its own timeframe.
 - Crosshair cursor with dashed X/Y guides follows the mouse.
+- Window menu lets you re-open hidden docks.
+- Settings dialog stub added under the Settings menu.
+- Theme editor stub added under Settings → Themes.
 
 ## Quick Start
 1) Create/activate your Python environment
