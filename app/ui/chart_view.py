@@ -133,6 +133,58 @@ class LiveKlineWorker(QThread):
             self._ws.run_forever(ping_interval=20, ping_timeout=10)
 
 
+class LiveTradeWorker(QThread):
+    trade = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, symbol: str) -> None:
+        super().__init__()
+        self.symbol = symbol
+        self._stop = False
+        self._ws = None
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            if self._ws is not None:
+                self._ws.close()
+        except Exception:
+            pass
+
+    def run(self) -> None:
+        try:
+            import websocket
+            import json
+        except Exception as exc:
+            self.error.emit(f'WebSocket dependency missing: {exc}')
+            return
+
+        stream = f"{self.symbol.lower()}@aggTrade"
+        url = f"wss://stream.binance.com:9443/ws/{stream}"
+
+        def on_message(ws, message):
+            if self._stop:
+                return
+            try:
+                payload = json.loads(message)
+                trade = {
+                    'ts_ms': int(payload.get('T', 0)),
+                    'price': float(payload.get('p', 0)),
+                    'qty': float(payload.get('q', 0)),
+                }
+                self.trade.emit(trade)
+            except Exception as exc:
+                self.error.emit(str(exc))
+
+        def on_error(ws, err):
+            if not self._stop:
+                self.error.emit(str(err))
+
+        self._ws = websocket.WebSocketApp(url, on_message=on_message, on_error=on_error)
+        while not self._stop:
+            self._ws.run_forever(ping_interval=20, ping_timeout=10)
+
+
 class ChartView(QWidget):
     def __init__(self, error_sink=None) -> None:
         super().__init__()
@@ -203,6 +255,7 @@ class ChartView(QWidget):
         self._worker: Optional[DataFetchWorker] = None
         self._symbol_worker: Optional[SymbolFetchWorker] = None
         self._kline_worker: Optional[LiveKlineWorker] = None
+        self._trade_worker: Optional[LiveTradeWorker] = None
 
     def _load_symbols(self) -> None:
         if self._symbol_worker and self._symbol_worker.isRunning():
@@ -295,10 +348,17 @@ class ChartView(QWidget):
         if self._kline_worker is not None:
             self._kline_worker.stop()
             self._kline_worker = None
+        if self._trade_worker is not None:
+            self._trade_worker.stop()
+            self._trade_worker = None
         self._kline_worker = LiveKlineWorker(symbol, timeframe)
         self._kline_worker.kline.connect(self._on_kline)
         self._kline_worker.error.connect(lambda msg: self._report_error(f'Live stream error: {msg}'))
         self._kline_worker.start()
+        self._trade_worker = LiveTradeWorker(symbol)
+        self._trade_worker.trade.connect(self._on_trade)
+        self._trade_worker.error.connect(lambda msg: self._report_error(f'Trade stream error: {msg}'))
+        self._trade_worker.start()
 
     def _on_kline(self, kline: dict) -> None:
         try:
@@ -320,3 +380,9 @@ class ChartView(QWidget):
                     self.store.store_bars(self.exchange, symbol, timeframe, [[ts, o, h, l, c, v]])
             except Exception as exc:
                 self._report_error(f'Cache update failed: {exc}')
+
+    def _on_trade(self, trade: dict) -> None:
+        try:
+            self.candles.update_live_trade(trade)
+        except Exception as exc:
+            self._report_error(f'Live trade update failed: {exc}')

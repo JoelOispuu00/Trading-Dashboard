@@ -24,3 +24,9 @@
 - Synced time-to-close to Binance event time.
 - Candle hover OHLC stats.
 
+## 0.2.1
+- Right-docked tab strip with vertical labels.
+- Refreshed latest bars on startup to avoid stale closes near rollover.
+- Faster live ticks via trade stream updates.
+- Countdown label now refreshes every second.
+- UI layout persists across restarts.

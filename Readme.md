@@ -10,6 +10,7 @@ Desktop charting app with TradingView-like dark theme, candlestick/Renko(TODO) c
 - Live chart updates (WebSocket) and price marker on the right axis.
 - Startup cache forward-fill and backfill are in place.
 - Hover shows OHLC + change stats for any candle.
+- Live updates now use both kline and trade streams for faster ticks.
 
 ## Quick Start
 1) Create/activate your Python environment

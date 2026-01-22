@@ -23,6 +23,11 @@ def load_recent_bars(
             forward_bars = binance.fetch_ohlcv(symbol, timeframe, cached_max + interval_ms, now_ms)
             store.store_bars(exchange, symbol, timeframe, forward_bars)
 
+    # Always refresh the most recent candle window to avoid stale closes near rollover.
+    recent_start = max(0, now_ms - (interval_ms * 2))
+    recent = binance.fetch_ohlcv(symbol, timeframe, recent_start, now_ms)
+    store.store_bars(exchange, symbol, timeframe, recent)
+
     cached = store.load_bars(exchange, symbol, timeframe, start_ms, now_ms)
     if cached:
         expected_min = int(bar_count * 0.9)

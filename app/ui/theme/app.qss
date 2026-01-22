@@ -16,6 +16,25 @@ QDockWidget::title {
     border-bottom: 1px solid #2A2E39;
 }
 
+QTabWidget::pane {
+    border: 1px solid #2A2E39;
+    background: #131722;
+}
+
+QTabBar::tab {
+    background: #1E222D;
+    color: #B2B5BE;
+    border: 1px solid #2A2E39;
+    padding: 6px 10px;
+    margin: 2px;
+}
+
+QTabBar::tab:selected {
+    background: #0F141E;
+    color: #FFFFFF;
+    border: 1px solid #3A3F4C;
+}
+
 QWidget {
     color: #B2B5BE;
     background-color: #131722;

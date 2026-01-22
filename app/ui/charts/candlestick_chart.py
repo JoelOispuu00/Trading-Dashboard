@@ -3,7 +3,7 @@ from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtCore import Qt, QRectF, QPointF, QTimer
 from PyQt6.QtGui import QFont, QPainter, QPicture, QColor, QPainterPath
 
 from .performance import calculate_visible_range, calculate_lod_step, MAX_VISIBLE_BARS_DENSE
@@ -152,6 +152,9 @@ class CandlestickChart:
         self.last_close_ms: Optional[int] = None
         self.last_event_ms: Optional[int] = None
         self.time_offset_ms: int = 0
+        self._countdown_timer = QTimer()
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._refresh_countdown)
         self.hover_label: Optional[pg.QtWidgets.QGraphicsTextItem] = None
 
         self.plot_widget.setClipToView(True)
@@ -170,6 +173,7 @@ class CandlestickChart:
 
         self._setup_price_axis()
         self._setup_date_index_axis()
+        self._countdown_timer.start()
 
     def _setup_price_axis(self) -> None:
         class PriceAxis(pg.AxisItem):
@@ -411,6 +415,37 @@ class CandlestickChart:
         self._update_price_line()
         self._update_day_gridlines()
 
+    def update_live_trade(self, trade: dict) -> None:
+        if not self.candles:
+            return
+        if self.timeframe_ms is None:
+            return
+        try:
+            ts_ms = int(trade.get('ts_ms', 0))
+            price = float(trade.get('price', 0))
+            qty = float(trade.get('qty', 0))
+        except (ValueError, TypeError):
+            return
+        if ts_ms <= 0 or price <= 0:
+            return
+
+        last = self.candles[-1]
+        if len(last) < 6:
+            return
+        last_ts = int(last[0])
+        if ts_ms < last_ts or ts_ms >= last_ts + self.timeframe_ms:
+            return
+
+        o, h, l, _, v = float(last[1]), float(last[2]), float(last[3]), float(last[4]), float(last[5])
+        h = max(h, price)
+        l = min(l, price)
+        v = v + max(0.0, qty)
+        self.candles[-1] = [last_ts, o, h, l, price, v]
+
+        self.item.set_data(self.candles, bar_colors=self.bar_colors)
+        self._update_volume_histogram(self.candles)
+        self._update_price_line()
+
     def _auto_range(self) -> None:
         if not self.candles:
             return
@@ -507,6 +542,11 @@ class CandlestickChart:
         if unit == 'd':
             return mult * 24 * 60 * 60 * 1000
         return 60 * 1000
+
+    def _refresh_countdown(self) -> None:
+        if self.last_close_ms is None:
+            return
+        self._update_price_line()
 
     def _update_price_label_position(self, price: float, color: QColor) -> None:
         if self.price_label is None:
