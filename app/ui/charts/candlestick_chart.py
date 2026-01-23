@@ -1,5 +1,6 @@
 from bisect import bisect_left, bisect_right
 from datetime import datetime
+import math
 import time
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -179,7 +180,6 @@ class CandlestickChart:
         self.base_color = QColor(up_color)
         self.down_color = QColor(down_color)
         self.candles: List[List[float]] = []
-        self._day_gridlines = []
         self.bar_colors: List[Optional[QColor]] = []
         self.volume_item: Optional[pg.BarGraphItem] = None
         self.volume_max: float = 0.0
@@ -259,6 +259,51 @@ class CandlestickChart:
                         out.append('')
                 return out
 
+            def tickValues(self, minVal, maxVal, size):
+                try:
+                    span = float(maxVal) - float(minVal)
+                except Exception:
+                    return []
+                if span <= 0:
+                    return []
+                target_ticks = max(2, int(size / 50))
+                raw_step = span / target_ticks
+                if raw_step <= 0:
+                    return []
+                exp = math.floor(math.log10(raw_step))
+                base = 10 ** exp
+                for mult in (1, 2, 5, 10):
+                    step = base * mult
+                    if step >= raw_step:
+                        break
+                start = math.floor(float(minVal) / step) * step
+                values = []
+                current = start
+                max_val = float(maxVal)
+                while current <= max_val:
+                    values.append(current)
+                    current += step
+                return [(step, values)]
+
+            def mouseDragEvent(self, ev) -> None:
+                if ev.button() != Qt.MouseButton.LeftButton:
+                    ev.ignore()
+                    return
+                ev.accept()
+                view = self.linkedView()
+                if view is None:
+                    return
+                dy = ev.pos().y() - ev.lastPos().y()
+                scale = 1.01 ** dy
+                try:
+                    center = view.mapSceneToView(ev.scenePos())
+                except Exception:
+                    center = None
+                if center is not None:
+                    view.scaleBy((1.0, scale), center=center)
+                else:
+                    view.scaleBy((1.0, scale))
+
         try:
             price_axis = PriceAxis(orientation='right')
             font = QFont()
@@ -267,7 +312,7 @@ class CandlestickChart:
             self.plot_widget.setAxisItems({'right': price_axis})
             self.plot_widget.showAxis('right')
             self.plot_widget.hideAxis('left')
-            price_axis.setWidth(70)
+            price_axis.setWidth(60)
         except Exception:
             pass
 
@@ -277,6 +322,7 @@ class CandlestickChart:
                 super().__init__(*args, **kwargs)
                 self.parent_chart = parent_chart
                 self._day_rollover_timestamps: List[float] = []
+                self._last_step_ms: Optional[int] = None
                 self._update_day_rollovers()
 
             def _update_day_rollovers(self):
@@ -296,18 +342,86 @@ class CandlestickChart:
                     except Exception:
                         continue
 
+            def _pick_step_ms(self, span_ms: float, target_ticks: int) -> int:
+                if span_ms <= 0:
+                    return 60_000
+                steps = [
+                    1_000,
+                    2_000,
+                    5_000,
+                    10_000,
+                    15_000,
+                    30_000,
+                    60_000,
+                    120_000,
+                    300_000,
+                    600_000,
+                    900_000,
+                    1_800_000,
+                    3_600_000,
+                    7_200_000,
+                    14_400_000,
+                    21_600_000,
+                    43_200_000,
+                    86_400_000,
+                    172_800_000,
+                    604_800_000,
+                    2_592_000_000,
+                ]
+                for step in steps:
+                    if span_ms / step <= target_ticks:
+                        return step
+                return steps[-1]
+
+            def _snap_step_ms(self, step_ms: int) -> int:
+                base = self.parent_chart.timeframe_ms or 60_000
+                if step_ms < base:
+                    return base
+                mult = int(max(1, round(step_ms / base)))
+                return base * mult
+
             def tickValues(self, minVal, maxVal, size):
-                if not self._day_rollover_timestamps:
-                    self._update_day_rollovers()
-                visible_ts = [ts for ts in self._day_rollover_timestamps if minVal <= ts <= maxVal]
-                if not visible_ts:
+                try:
+                    span_ms = float(maxVal) - float(minVal)
+                except Exception:
                     return []
-                step = max(1, len(visible_ts) // 10)
-                selected = visible_ts[::max(1, step)]
-                return [(1, selected)]
+                if span_ms <= 0:
+                    return []
+                target_ticks = max(2, int(size / 120))
+                step_ms = self._pick_step_ms(span_ms, target_ticks)
+                step_ms = self._snap_step_ms(step_ms)
+                self._last_step_ms = step_ms
+                try:
+                    start = math.floor(float(minVal) / step_ms) * step_ms
+                except Exception:
+                    start = float(minVal)
+                values = []
+                current = start
+                max_val = float(maxVal)
+                while current <= max_val:
+                    values.append(current)
+                    current += step_ms
+                return [(1, values)]
 
             def tickStrings(self, values, scale, spacing):
                 out = []
+                step_ms = self._last_step_ms or 60_000
+                span_ms = 0.0
+                if values:
+                    try:
+                        span_ms = float(max(values)) - float(min(values))
+                    except Exception:
+                        span_ms = 0.0
+                if step_ms < 60_000:
+                    fmt = '%H:%M:%S'
+                elif step_ms < 3_600_000 and span_ms <= 2 * 86_400_000:
+                    fmt = '%H:%M'
+                elif step_ms < 86_400_000:
+                    fmt = '%b %d %H:%M'
+                elif step_ms < 2_592_000_000:
+                    fmt = '%b %d'
+                else:
+                    fmt = '%Y-%m'
                 for v in values:
                     try:
                         ts_ms = float(v)
@@ -316,12 +430,31 @@ class CandlestickChart:
                         continue
                     try:
                         dt = datetime.fromtimestamp(ts_ms / 1000.0)
-                        date_str = dt.strftime('%Y-%m-%d')
+                        date_str = dt.strftime(fmt)
                     except Exception:
                         out.append('')
                         continue
                     out.append(date_str)
                 return out
+
+            def mouseDragEvent(self, ev) -> None:
+                if ev.button() != Qt.MouseButton.LeftButton:
+                    ev.ignore()
+                    return
+                ev.accept()
+                view = self.linkedView()
+                if view is None:
+                    return
+                dx = ev.pos().x() - ev.lastPos().x()
+                scale = 1.01 ** dx
+                try:
+                    center = view.mapSceneToView(ev.scenePos())
+                except Exception:
+                    center = None
+                if center is not None:
+                    view.scaleBy((scale, 1.0), center=center)
+                else:
+                    view.scaleBy((scale, 1.0))
 
         bottom_axis = DateIndexAxis(self, orientation='bottom')
         font = QFont()
@@ -334,37 +467,6 @@ class CandlestickChart:
         if left_axis:
             left_axis.setTickFont(font)
         self._date_index_axis = bottom_axis
-        self._update_day_gridlines()
-
-    def _update_day_gridlines(self) -> None:
-        for line in self._day_gridlines:
-            try:
-                self.plot_widget.removeItem(line)
-            except Exception:
-                pass
-        self._day_gridlines = []
-        if not self.candles:
-            if hasattr(self, '_date_index_axis') and self._date_index_axis:
-                self._date_index_axis._update_day_rollovers()
-            return
-        last_day = None
-        gridline_color = QColor(self.base_color)
-        gridline_color.setAlpha(20)
-        pen = pg.mkPen(gridline_color, width=1)
-        for idx, candle in enumerate(self.candles):
-            try:
-                ts_ms = float(candle[0])
-                dt = datetime.fromtimestamp(ts_ms / 1000.0)
-                current_day = dt.date()
-                if last_day is not None and current_day != last_day:
-                    gridline = pg.InfiniteLine(pos=float(ts_ms), angle=90, pen=pen)
-                    self.plot_widget.addItem(gridline)
-                    self._day_gridlines.append(gridline)
-                last_day = current_day
-            except Exception:
-                continue
-        if hasattr(self, '_date_index_axis') and self._date_index_axis:
-            self._date_index_axis._update_day_rollovers()
 
     def _on_view_changed(self) -> None:
         try:
@@ -428,7 +530,6 @@ class CandlestickChart:
         self._update_volume_histogram(self.candles)
         self._update_price_line()
         self._update_history_end_label()
-        self._update_day_gridlines()
         if auto_range:
             self._auto_range()
 
@@ -475,7 +576,6 @@ class CandlestickChart:
         self._update_volume_histogram(self.candles)
         self._update_price_line()
         self._update_history_end_label()
-        self._update_day_gridlines()
 
     def update_live_trade(self, trade: dict) -> None:
         if not self.candles:
@@ -570,6 +670,7 @@ class CandlestickChart:
         if self.price_label is None:
             self.price_label = pg.QtWidgets.QGraphicsTextItem()
             self.price_label.setDefaultTextColor(QColor('#FFFFFF'))
+            self.price_label.document().setDocumentMargin(0)
             self.price_label.setZValue(51)
             plot_item = self.plot_widget.getPlotItem()
             plot_item.scene().addItem(self.price_label)
@@ -669,13 +770,17 @@ class CandlestickChart:
         axis_rect = axis.sceneBoundingRect() if axis else None
 
         text_rect = self.price_label.boundingRect()
-        padding_x = 6
+        padding_x = 8
         padding_y = 4
         pill_width = text_rect.width() + padding_x * 2
         pill_height = text_rect.height() + padding_y * 2
 
-        if axis_rect is not None:
-            x = axis_rect.left() + 2
+        if axis is not None:
+            axis_width = axis.width()
+            if axis_width <= 0:
+                axis_width = 70
+            x = view_box.sceneBoundingRect().right() + 1
+            pill_width = axis_width
         else:
             x = view_box.sceneBoundingRect().right() + 6
         y = scene_pos.y() - (pill_height / 2)
@@ -689,7 +794,17 @@ class CandlestickChart:
 
         path = QPainterPath()
         radius = 5.0
-        path.addRoundedRect(QRectF(x, y, pill_width, pill_height), radius, radius)
+        left = x
+        right = x + pill_width
+        top = y
+        bottom = y + pill_height
+        path.moveTo(left, top)
+        path.lineTo(right - radius, top)
+        path.quadTo(right, top, right, top + radius)
+        path.lineTo(right, bottom - radius)
+        path.quadTo(right, bottom, right - radius, bottom)
+        path.lineTo(left, bottom)
+        path.closeSubpath()
         bg_color = QColor(color)
         bg_color.setAlpha(230)
         self.price_label_bg.setPath(path)

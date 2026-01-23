@@ -13,6 +13,21 @@ from .theme import theme
 from .charts.candlestick_chart import CandlestickChart
 
 
+class TimeScaleViewBox(pg.ViewBox):
+    def wheelEvent(self, ev) -> None:
+        if ev is None:
+            return
+        try:
+            delta = ev.angleDelta().y()
+        except Exception:
+            delta = ev.delta() if hasattr(ev, "delta") else 0
+        if delta == 0:
+            return
+        scale = 1.06 ** (delta / 120.0)
+        self.scaleBy((1.0 / scale, 1.0))
+        ev.accept()
+
+
 class DataFetchWorker(QThread):
     data_ready = pyqtSignal(list)
     error = pyqtSignal(str)
@@ -281,12 +296,14 @@ class ChartView(QWidget):
         self.tab_bar.tabMoved.connect(self._on_tab_moved)
         layout.addWidget(self.tab_bar)
 
-        self.plot_widget = pg.PlotWidget()
+        view_box = TimeScaleViewBox()
+        self.plot_widget = pg.PlotWidget(viewBox=view_box)
         self.plot_widget.setBackground(theme.BACKGROUND)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
         self.plot_widget.setClipToView(True)
 
         self._apply_axis_style()
+        self._ensure_grid_visible()
 
         layout.addWidget(self.plot_widget)
         self.plot_widget.getViewBox().sigRangeChanged.connect(self._on_view_range_changed)
@@ -303,6 +320,20 @@ class ChartView(QWidget):
         self._skip_next_plus = False
         self._settings = QSettings('TradingDashboard', 'TradingDashboard')
         self.symbol_box.currentIndexChanged.connect(self._on_symbol_changed)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._ensure_grid_visible()
+
+    def _ensure_grid_visible(self) -> None:
+        try:
+            self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
+            for axis_name in ('left', 'right', 'bottom'):
+                axis = self.plot_widget.getAxis(axis_name)
+                if axis:
+                    axis.setGrid(0.2)
+        except Exception:
+            pass
 
     def _apply_axis_style(self) -> None:
         axis_pen = pg.mkPen(theme.GRID)

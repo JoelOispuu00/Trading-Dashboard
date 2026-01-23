@@ -65,3 +65,7 @@
 ## 0.5.0
 - Renamed app to PySuperChart.
 - Added a custom title bar and app icon.
+- Mouse wheel zoom now only affects the time axis.
+- Increased mouse wheel zoom sensitivity.
+- Left-drag on the price scale adjusts the y-axis.
+- Enabled pyqtgraph grid by default with denser major price ticks.

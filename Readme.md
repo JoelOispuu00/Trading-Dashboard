@@ -25,6 +25,9 @@ Desktop charting app with TradingView-like dark theme, candlestick/Renko(TODO) c
 - Settings dialog stub added under the Settings menu.
 - Theme editor stub added under Settings → Themes.
 - Custom title bar and app icon set for PySuperChart.
+- Mouse wheel zoom now only affects the time axis.
+- Mouse wheel zoom sensitivity increased.
+- Left-drag on the price scale adjusts the y-axis.
 
 ## Quick Start
 1) Create/activate your Python environment
