@@ -112,3 +112,10 @@
 - Windowed fetch now reuses cached edges and only fetches missing ranges when possible.
 - Backfill now re-evaluates the live view range and retriggers when returning to current time.
 - Suppressed live updates during fresh symbol/timeframe loads without cache to avoid partial renders.
+
+## 0.6.0
+- Added NumPy-backed indicator runtime helpers (ctx) as the foundation for indicators.
+- Added a renderer bridge for indicator outputs (lines/bands/hist/markers/regions).
+- Implemented indicator discovery and a polling hot-reload watcher.
+- Added a full set of built-in indicator modules (MA family, RSI/Stoch, MACD, bands, volatility, trend).
+- Wired the indicator UI with persistence, parameter controls, and multi-pane rendering.

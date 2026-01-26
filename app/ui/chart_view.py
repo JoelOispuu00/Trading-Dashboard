@@ -1,7 +1,9 @@
+import json
 import os
 import time
+import uuid
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 import pyqtgraph as pg
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox, QLabel, QCompleter, QButtonGroup, QTabBar, QStyle, QLineEdit, QMenu
 from PyQt6.QtGui import QFont, QColor, QLinearGradient, QBrush, QIcon
@@ -9,8 +11,12 @@ from PyQt6.QtCore import QThread, pyqtSignal, QSortFilterProxyModel, Qt, QTimer,
 
 from core.data_store import DataStore
 from core.data_fetch import load_recent_bars, load_symbols, load_more_history, load_cached_bars, load_cached_full, load_window_bars, timeframe_to_ms, ensure_history_floor
+from core.indicator_registry import discover_indicators, IndicatorInfo
+from core.hot_reload import start_watcher, IndicatorHotReloadWorker
 from .theme import theme
 from .charts.candlestick_chart import CandlestickChart
+from indicators.runtime import run_compute
+from indicators.renderer import IndicatorRenderer
 
 
 class TimeScaleViewBox(pg.ViewBox):
@@ -265,7 +271,7 @@ class LiveTradeWorker(QThread):
 
 
 class ChartView(QWidget):
-    def __init__(self, error_sink=None, debug_sink=None) -> None:
+    def __init__(self, error_sink=None, debug_sink=None, indicator_panel=None) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -333,6 +339,11 @@ class ChartView(QWidget):
         self.tab_bar.customContextMenuRequested.connect(self._on_tab_context_menu)
         layout.addWidget(self.tab_bar)
 
+        self._chart_container = QWidget()
+        self._chart_layout = QVBoxLayout(self._chart_container)
+        self._chart_layout.setContentsMargins(0, 0, 0, 0)
+        self._chart_layout.setSpacing(0)
+
         view_box = TimeScaleViewBox()
         self.plot_widget = pg.PlotWidget(viewBox=view_box)
         gradient = QLinearGradient(0, 0, 0, 1)
@@ -357,16 +368,19 @@ class ChartView(QWidget):
         self._apply_axis_style()
         self._ensure_grid_visible()
 
-        layout.addWidget(self.plot_widget)
+        self._chart_layout.addWidget(self.plot_widget)
+        layout.addWidget(self._chart_container)
         self.plot_widget.getViewBox().sigRangeChanged.connect(self._on_view_range_changed)
-
-        self.candles = CandlestickChart(self.plot_widget, theme.UP, theme.DOWN)
-        self._setup_data_store()
-        self._load_symbols()
 
         self.load_button.clicked.connect(self._on_load_clicked)
         self.error_sink = error_sink
         self.debug_sink = debug_sink
+        self.indicator_panel = indicator_panel
+
+        self.candles = CandlestickChart(self.plot_widget, theme.UP, theme.DOWN)
+        self._setup_data_store()
+        self._setup_indicator_system()
+        self._load_symbols()
         self._debug_last_update = 0.0
         self._tab_syncing = False
         self._skip_next_plus = False
@@ -459,6 +473,380 @@ class ChartView(QWidget):
         self._initial_load_pending = False
         self._pending_kline: Optional[dict] = None
         self._pending_trade: Optional[dict] = None
+        self._indicator_paths = [
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "indicators", "builtins")),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "indicators", "custom")),
+        ]
+        self._indicator_defs: Dict[str, IndicatorInfo] = {}
+        self._indicator_instances: List[Dict[str, object]] = []
+        self._indicator_renderers: Dict[str, IndicatorRenderer] = {
+            "price": IndicatorRenderer(self.plot_widget.getPlotItem())
+        }
+        self._indicator_panes: Dict[str, pg.PlotWidget] = {"price": self.plot_widget}
+        self._indicator_hot_reload: Optional[IndicatorHotReloadWorker] = None
+        self._indicator_recompute_pending = False
+        self._indicator_next_pane_index = 1
+
+    def _setup_indicator_system(self) -> None:
+        self._load_indicator_definitions()
+        self._load_indicator_instances()
+        self._wire_indicator_panel()
+        self._start_indicator_hot_reload()
+        self._recompute_indicators()
+
+    def _load_indicator_definitions(self) -> None:
+        indicators = discover_indicators(self._indicator_paths)
+        self._indicator_defs = {info.indicator_id: info for info in indicators}
+        self._update_indicator_panel()
+
+    def _start_indicator_hot_reload(self) -> None:
+        if self._indicator_hot_reload is not None:
+            return
+        self._indicator_hot_reload = start_watcher(
+            self._indicator_paths,
+            self._on_indicators_updated,
+            self._on_indicator_error,
+            poll_interval=1.0,
+        )
+
+    def _on_indicators_updated(self, indicators: List[IndicatorInfo]) -> None:
+        self._indicator_defs = {info.indicator_id: info for info in indicators}
+        for instance in self._indicator_instances:
+            indicator_id = instance.get("indicator_id")
+            info = self._indicator_defs.get(indicator_id)
+            if info:
+                instance["info"] = info
+                instance["schema"] = self._build_schema(info)
+        self._update_indicator_panel()
+        self._recompute_indicators()
+
+    def _on_indicator_error(self, message: str) -> None:
+        self._report_error(f'Indicator reload failed: {message}')
+
+    def _wire_indicator_panel(self) -> None:
+        if self.indicator_panel is None:
+            return
+        self.indicator_panel.indicator_add_requested.connect(self._add_indicator_instance)
+        self.indicator_panel.indicator_instance_selected.connect(self._select_indicator_instance)
+        self.indicator_panel.indicator_remove_requested.connect(self._remove_indicator_instance)
+        self.indicator_panel.indicator_visibility_toggled.connect(self._toggle_indicator_visibility)
+        self.indicator_panel.indicator_params_changed.connect(self._update_indicator_params)
+        self.indicator_panel.indicator_pane_changed.connect(self._move_indicator_instance)
+        self.indicator_panel.indicator_reset_requested.connect(self._reset_indicator_defaults)
+        self._update_indicator_panel()
+
+    def _update_indicator_panel(self) -> None:
+        if self.indicator_panel is None:
+            return
+        available = []
+        for info in self._indicator_defs.values():
+            available.append(
+                {
+                    "indicator_id": info.indicator_id,
+                    "name": info.name,
+                    "inputs": info.inputs,
+                    "pane": info.pane,
+                }
+            )
+        available.sort(key=lambda item: item["name"].lower())
+        self.indicator_panel.set_available_indicators(available)
+        pane_ids = self._current_pane_ids()
+        instances = []
+        for instance in self._indicator_instances:
+            instances.append(
+                {
+                    "instance_id": instance.get("instance_id"),
+                    "indicator_id": instance.get("indicator_id"),
+                    "name": instance.get("name"),
+                    "pane_id": instance.get("pane_id"),
+                    "params": instance.get("params"),
+                    "schema": instance.get("schema"),
+                    "visible": instance.get("visible", True),
+                }
+            )
+        self.indicator_panel.set_indicator_instances(instances, pane_ids)
+
+    def _load_indicator_instances(self) -> None:
+        if self.store is None:
+            return
+        rows = self.store.get_indicator_instances()
+        instances: List[Dict[str, object]] = []
+        for instance_id, indicator_id, pane_id, params_json, visible, sort_index in rows:
+            info = self._indicator_defs.get(indicator_id)
+            if info is None:
+                continue
+            schema = self._build_schema(info)
+            params = self._merge_params(schema.get("inputs", {}), params_json)
+            pane_id = self._normalize_pane_id(schema, pane_id)
+            self._ensure_indicator_pane(pane_id)
+            instances.append(
+                {
+                    "instance_id": instance_id,
+                    "indicator_id": indicator_id,
+                    "name": schema.get("name", indicator_id),
+                    "pane_id": pane_id,
+                    "params": params,
+                    "visible": visible,
+                    "sort_index": sort_index,
+                    "schema": schema,
+                    "info": info,
+                    "last_output": None,
+                }
+            )
+        self._indicator_instances = instances
+
+    def _build_schema(self, info: IndicatorInfo) -> Dict[str, object]:
+        try:
+            schema_fn = getattr(info.module, "schema", None)
+            if schema_fn is not None:
+                schema = schema_fn()
+                if isinstance(schema, dict):
+                    return schema
+        except Exception:
+            pass
+        return {"id": info.indicator_id, "name": info.name, "inputs": info.inputs, "pane": info.pane}
+
+    def _merge_params(self, inputs: Dict[str, dict], params_json: str) -> Dict[str, object]:
+        params: Dict[str, object] = {}
+        try:
+            params = json.loads(params_json) if params_json else {}
+        except Exception:
+            params = {}
+        for key, spec in inputs.items():
+            if key not in params and "default" in spec:
+                params[key] = spec["default"]
+        return params
+
+    def _normalize_pane_id(self, schema: Dict[str, object], pane_id: str) -> str:
+        pane = str(schema.get("pane") or "price")
+        if pane in ("price", "overlay"):
+            return "price"
+        if pane in ("new", "pane") and (not pane_id or pane_id == "new"):
+            return self._allocate_pane_id()
+        if pane_id:
+            return pane_id
+        return self._allocate_pane_id()
+
+    def _allocate_pane_id(self) -> str:
+        while True:
+            pane_id = f"pane-{self._indicator_next_pane_index}"
+            self._indicator_next_pane_index += 1
+            if pane_id not in self._indicator_panes:
+                return pane_id
+
+    def _ensure_indicator_pane(self, pane_id: str) -> None:
+        if pane_id == "price":
+            return
+        if pane_id in self._indicator_panes:
+            return
+        view_box = pg.ViewBox()
+        pane_plot = pg.PlotWidget(viewBox=view_box)
+        gradient = QLinearGradient(0, 0, 0, 1)
+        gradient.setCoordinateMode(QLinearGradient.CoordinateMode.ObjectBoundingMode)
+        gradient.setColorAt(0.0, QColor('#141A26'))
+        gradient.setColorAt(1.0, QColor('#101520'))
+        pane_plot.setBackground(QBrush(gradient))
+        pane_plot.showGrid(x=True, y=True, alpha=0.2)
+        pane_plot.setClipToView(True)
+        pane_plot.setStyleSheet("border: 0px;")
+        pane_plot.setXLink(self.plot_widget)
+        try:
+            pane_plot.hideAxis('left')
+            pane_plot.hideAxis('bottom')
+        except Exception:
+            pass
+        self._apply_axis_style_to_plot(pane_plot)
+        self._chart_layout.addWidget(pane_plot)
+        self._indicator_panes[pane_id] = pane_plot
+        self._indicator_renderers[pane_id] = IndicatorRenderer(pane_plot.getPlotItem())
+
+    def _apply_axis_style_to_plot(self, plot_widget: pg.PlotWidget) -> None:
+        axis_pen = pg.mkPen(theme.GRID)
+        text_pen = pg.mkPen(theme.TEXT)
+        font = QFont()
+        font.setPointSize(8)
+        for axis_name in ('left', 'bottom', 'right'):
+            axis = plot_widget.getAxis(axis_name)
+            axis.setPen(axis_pen)
+            try:
+                axis.setTickPen(axis_pen)
+                axis.setStyle(tickPen=axis_pen)
+            except Exception:
+                pass
+            axis.setTextPen(text_pen)
+            axis.setTickFont(font)
+
+    def _current_pane_ids(self) -> List[str]:
+        return list(self._indicator_panes.keys())
+
+    def _add_indicator_instance(self, indicator_id: str) -> None:
+        info = self._indicator_defs.get(indicator_id)
+        if info is None:
+            self._report_error(f'Indicator not found: {indicator_id}')
+            return
+        schema = self._build_schema(info)
+        pane_id = self._normalize_pane_id(schema, "")
+        self._ensure_indicator_pane(pane_id)
+        params = self._merge_params(schema.get("inputs", {}), "")
+        instance_id = uuid.uuid4().hex
+        sort_index = len(self._indicator_instances)
+        instance = {
+            "instance_id": instance_id,
+            "indicator_id": indicator_id,
+            "name": schema.get("name", indicator_id),
+            "pane_id": pane_id,
+            "params": params,
+            "visible": True,
+            "sort_index": sort_index,
+            "schema": schema,
+            "info": info,
+            "last_output": None,
+        }
+        self._indicator_instances.append(instance)
+        self._persist_indicator_instance(instance)
+        self._update_indicator_panel()
+        self._recompute_indicators()
+
+    def _select_indicator_instance(self, instance_id: str) -> None:
+        _ = instance_id
+
+    def _remove_indicator_instance(self, instance_id: str) -> None:
+        instance = self._find_indicator_instance(instance_id)
+        if instance is None:
+            return
+        pane_id = instance.get("pane_id", "price")
+        renderer = self._indicator_renderers.get(pane_id)
+        if renderer:
+            renderer.clear_namespace(instance_id)
+        self._indicator_instances = [inst for inst in self._indicator_instances if inst.get("instance_id") != instance_id]
+        self.store.delete_indicator_instance(instance_id)
+        self._cleanup_empty_panes()
+        self._update_indicator_panel()
+
+    def _toggle_indicator_visibility(self, instance_id: str, visible: bool) -> None:
+        instance = self._find_indicator_instance(instance_id)
+        if instance is None:
+            return
+        instance["visible"] = visible
+        self._persist_indicator_instance(instance)
+        if not visible:
+            pane_id = instance.get("pane_id", "price")
+            renderer = self._indicator_renderers.get(pane_id)
+            if renderer:
+                renderer.clear_namespace(instance_id)
+        self._update_indicator_panel()
+        if visible:
+            self._recompute_indicators()
+
+    def _update_indicator_params(self, instance_id: str, params: dict) -> None:
+        instance = self._find_indicator_instance(instance_id)
+        if instance is None:
+            return
+        instance["params"] = params
+        self._persist_indicator_instance(instance)
+        self._recompute_indicators()
+
+    def _move_indicator_instance(self, instance_id: str, pane_id: str) -> None:
+        instance = self._find_indicator_instance(instance_id)
+        if instance is None:
+            return
+        old_pane = instance.get("pane_id", "price")
+        if pane_id == old_pane:
+            return
+        self._ensure_indicator_pane(pane_id)
+        instance["pane_id"] = pane_id
+        self._persist_indicator_instance(instance)
+        renderer = self._indicator_renderers.get(old_pane)
+        if renderer:
+            renderer.clear_namespace(instance_id)
+        self._cleanup_empty_panes()
+        self._update_indicator_panel()
+        self._recompute_indicators()
+
+    def _reset_indicator_defaults(self, instance_id: str) -> None:
+        instance = self._find_indicator_instance(instance_id)
+        if instance is None:
+            return
+        schema = instance.get("schema") or {}
+        params = self._merge_params(schema.get("inputs", {}), "")
+        instance["params"] = params
+        self._persist_indicator_instance(instance)
+        self._update_indicator_panel()
+        self._recompute_indicators()
+
+    def _find_indicator_instance(self, instance_id: str) -> Optional[Dict[str, object]]:
+        for instance in self._indicator_instances:
+            if instance.get("instance_id") == instance_id:
+                return instance
+        return None
+
+    def _persist_indicator_instance(self, instance: Dict[str, object]) -> None:
+        try:
+            params_json = json.dumps(instance.get("params", {}))
+            self.store.upsert_indicator_instance(
+                instance_id=str(instance.get("instance_id")),
+                indicator_id=str(instance.get("indicator_id")),
+                pane_id=str(instance.get("pane_id")),
+                params_json=params_json,
+                visible=bool(instance.get("visible", True)),
+                sort_index=int(instance.get("sort_index", 0)),
+            )
+        except Exception as exc:
+            self._report_error(f'Indicator persistence failed: {exc}')
+
+    def _cleanup_empty_panes(self) -> None:
+        used_panes = {inst.get("pane_id", "price") for inst in self._indicator_instances}
+        for pane_id in list(self._indicator_panes.keys()):
+            if pane_id == "price":
+                continue
+            if pane_id not in used_panes:
+                plot_widget = self._indicator_panes.pop(pane_id, None)
+                renderer = self._indicator_renderers.pop(pane_id, None)
+                if renderer:
+                    renderer.clear()
+                if plot_widget:
+                    try:
+                        self._chart_layout.removeWidget(plot_widget)
+                        plot_widget.deleteLater()
+                    except Exception:
+                        pass
+
+    def _recompute_indicators(self) -> None:
+        if self._indicator_recompute_pending:
+            return
+        self._indicator_recompute_pending = True
+        QTimer.singleShot(0, self._do_recompute_indicators)
+
+    def _do_recompute_indicators(self) -> None:
+        self._indicator_recompute_pending = False
+        if self._initial_load_pending:
+            return
+        bars = getattr(self.candles, "candles", [])
+        if not bars:
+            return
+        for instance in self._indicator_instances:
+            if not instance.get("visible", True):
+                continue
+            info = instance.get("info")
+            if info is None:
+                continue
+            compute_fn = getattr(info.module, "compute", None)
+            if compute_fn is None:
+                continue
+            params = instance.get("params", {})
+            try:
+                output, required = run_compute(bars, params, compute_fn)
+                instance["required_lookback"] = required
+                if required and len(bars) < required:
+                    continue
+            except Exception as exc:
+                self._report_error(f'Indicator {instance.get("indicator_id")} failed: {exc}')
+                continue
+            pane_id = instance.get("pane_id", "price")
+            renderer = self._indicator_renderers.get(pane_id)
+            if renderer:
+                renderer.render(bars, output or {}, namespace=str(instance.get("instance_id")))
+
 
     def _load_symbols(self) -> None:
         if self._symbol_worker and self._symbol_worker.isRunning():
@@ -813,6 +1201,7 @@ class ChartView(QWidget):
             except Exception as exc:
                 self._ignore_view_range = False
                 self._report_error(f'Chart render failed: {exc}')
+        self._recompute_indicators()
         self._refresh_history_end_status()
         self._emit_debug_state()
         self._start_live_stream()
@@ -935,6 +1324,13 @@ class ChartView(QWidget):
         if self._symbol_worker and self._symbol_worker.isRunning():
             self._symbol_worker.quit()
             self._symbol_worker.wait(1500)
+        if self._indicator_hot_reload is not None:
+            try:
+                self._indicator_hot_reload.stop()
+                self._indicator_hot_reload.wait(1500)
+            except Exception:
+                pass
+            self._indicator_hot_reload = None
         if self._kline_worker is not None:
             self._kline_worker.stop()
             self._kline_worker.wait(1500)
@@ -971,6 +1367,7 @@ class ChartView(QWidget):
                     self.store.store_bars(self.exchange, symbol, timeframe, [[ts, o, h, l, c, v]])
             except Exception as exc:
                 self._report_error(f'Cache update failed: {exc}')
+            self._recompute_indicators()
         self._emit_debug_state()
 
     def _on_trade(self, trade: dict) -> None:
@@ -1009,6 +1406,7 @@ class ChartView(QWidget):
                 self.candles.update_live_trade(trade)
             except Exception as exc:
                 self._report_error(f'Live trade update failed: {exc}')
+        self._recompute_indicators()
 
     def _set_timeframe(self, timeframe: str) -> None:
         if timeframe == self.current_timeframe:

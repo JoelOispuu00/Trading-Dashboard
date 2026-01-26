@@ -59,6 +59,18 @@ class DataStore:
                 )
                 '''
             )
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS indicator_instances (
+                    instance_id TEXT PRIMARY KEY,
+                    indicator_id TEXT NOT NULL,
+                    pane_id TEXT NOT NULL,
+                    params_json TEXT NOT NULL,
+                    visible INTEGER NOT NULL DEFAULT 1,
+                    sort_index INTEGER NOT NULL DEFAULT 0
+                )
+                '''
+            )
 
     def get_cached_range(self, exchange: str, symbol: str, timeframe: str) -> Optional[Tuple[int, int]]:
         with self._connect() as conn:
@@ -188,4 +200,45 @@ class DataStore:
                 WHERE exchange=? AND symbol=? AND timeframe=?
                 ''',
                 (exchange, symbol, timeframe),
+            )
+
+    def get_indicator_instances(self) -> List[Tuple[str, str, str, str, bool, int]]:
+        with self._connect() as conn:
+            cur = conn.execute(
+                '''
+                SELECT instance_id, indicator_id, pane_id, params_json, visible, sort_index
+                FROM indicator_instances
+                ORDER BY sort_index ASC
+                '''
+            )
+            rows = cur.fetchall()
+        return [(row[0], row[1], row[2], row[3], bool(row[4]), int(row[5])) for row in rows]
+
+    def upsert_indicator_instance(
+        self,
+        instance_id: str,
+        indicator_id: str,
+        pane_id: str,
+        params_json: str,
+        visible: bool,
+        sort_index: int,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT OR REPLACE INTO indicator_instances
+                (instance_id, indicator_id, pane_id, params_json, visible, sort_index)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (instance_id, indicator_id, pane_id, params_json, int(visible), sort_index),
+            )
+
+    def delete_indicator_instance(self, instance_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                DELETE FROM indicator_instances
+                WHERE instance_id=?
+                ''',
+                (instance_id,),
             )

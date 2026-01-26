@@ -90,7 +90,11 @@ class MainWindow(QMainWindow):
         self.indicator_panel = IndicatorPanel()
         self.error_dock = ErrorDock()
         self.debug_dock = DebugDock()
-        self.chart_view = ChartView(error_sink=self.error_dock, debug_sink=self.debug_dock)
+        self.chart_view = ChartView(
+            error_sink=self.error_dock,
+            debug_sink=self.debug_dock,
+            indicator_panel=self.indicator_panel,
+        )
 
         self._menu_bar = QMenuBar()
         self.title_bar = TitleBar(self, self._menu_bar)
