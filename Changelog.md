@@ -113,9 +113,35 @@
 - Backfill now re-evaluates the live view range and retriggers when returning to current time.
 - Suppressed live updates during fresh symbol/timeframe loads without cache to avoid partial renders.
 
-## 0.6.0
+## 0.7.0
 - Added NumPy-backed indicator runtime helpers (ctx) as the foundation for indicators.
 - Added a renderer bridge for indicator outputs (lines/bands/hist/markers/regions).
 - Implemented indicator discovery and a polling hot-reload watcher.
 - Added a full set of built-in indicator modules (MA family, RSI/Stoch, MACD, bands, volatility, trend).
 - Wired the indicator UI with persistence, parameter controls, and multi-pane rendering.
+
+## 0.7.1
+- Debounced indicator recompute on view changes and render indicators on the visible window + lookback.
+- Cached line-mode candle chunks and precomputed OHLC arrays for faster CPU rendering.
+- Reworked volume histogram to a QPicture renderer with chunk caching.
+- Moved indicator compute, candle normalization, and volume prep into worker threads.
+- Added background backfill decision worker and precomputed volume view hints.
+- Added compute/normalize/backfill/volume prep timings to the debug dock and throttled live indicator recompute.
+- Coalesced live candle redraws and skipped redraws when OHLCV is unchanged.
+- Deferred applying fetched bars until view settles and batched candle updates to reduce pan stutter.
+- Fixed volume histogram culling by updating its view-aligned bounds on pan/zoom.
+- Skipped indicator recompute when the view window is unchanged and capped compute window size.
+- Added incremental candle normalization for window slices that are subsets/supersets of current data.
+- Debounced crosshair updates and volume view updates to reduce per-mouse-move and pan load.
+- Throttled live volume updates to avoid rebuilding the histogram on every trade tick.
+- Restored full-view indicator computation on zoomed-out views to avoid truncating left-side plots.
+- Live indicator recompute now treats view changes as full-view recomputes to avoid partial plots after zoom.
+- Added tail-only volume updates to avoid rebuilding volume chunks on every live tick.
+- Cached indicator series buffers and applied tail-only updates for live recomputes.
+- Reduced indicator compute allocations by reusing normalized bars and returning NumPy views.
+- Skipped indicator recompute when view index range is unchanged.
+- Downsampled indicator series/bands/hist when zoomed out to reduce render load.
+- Frozen indicator recompute while zoomed out and re-run on idle to smooth panning.
+- Throttled backfill decision frequency when zoomed out to avoid extra work during pans.
+- Suppressed live indicator and volume histogram recomputes while zoomed out (tail updates still apply).
+- Cached indicator outputs per window and reuse cached values on pan/zoom instead of recomputing.

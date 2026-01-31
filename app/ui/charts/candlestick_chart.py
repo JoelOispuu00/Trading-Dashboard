@@ -6,10 +6,55 @@ from typing import Callable, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QRectF, QPointF, QTimer, QLineF
+from PyQt6.QtCore import Qt, QRectF, QPointF, QTimer, QLineF, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPainter, QPicture, QColor, QPainterPath
 
-from .volume_histogram import update_volume_histogram
+from .volume_histogram import (
+    update_volume_histogram,
+    update_volume_histogram_arrays,
+    VolumeHistogramItem,
+    MAX_VISIBLE_BARS_DENSE,
+    calculate_lod_step,
+)
+
+
+class VolumePrepWorker(QThread):
+    ready = pyqtSignal(int, object, object, object, object)
+    error = pyqtSignal(str)
+
+    def __init__(self, candles: List[Iterable[float]], x_min: Optional[float], x_max: Optional[float], seq: int) -> None:
+        super().__init__()
+        self._candles = candles
+        self._x_min = x_min
+        self._x_max = x_max
+        self._seq = seq
+
+    def run(self) -> None:
+        try:
+            x_vals = []
+            vol_vals = []
+            is_up = []
+            for idx, candle in enumerate(self._candles):
+                try:
+                    x_vals.append(float(candle[0]))
+                    vol_vals.append(float(candle[5]) if len(candle) > 5 and candle[5] is not None else 0.0)
+                    o = float(candle[1])
+                    c = float(candle[4])
+                    is_up.append(c >= o)
+                except Exception:
+                    x_vals.append(float(idx))
+                    vol_vals.append(0.0)
+                    is_up.append(True)
+            view_hint = None
+            if self._x_min is not None and self._x_max is not None and x_vals:
+                start_idx = max(0, bisect_left(x_vals, self._x_min) - 10)
+                end_idx = min(len(x_vals), bisect_right(x_vals, self._x_max) + 10)
+                visible_count = max(0, end_idx - start_idx)
+                step = calculate_lod_step(visible_count, MAX_VISIBLE_BARS_DENSE)
+                view_hint = (start_idx, end_idx, step, float(self._x_min), float(self._x_max))
+            self.ready.emit(self._seq, x_vals, vol_vals, is_up, view_hint)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class CandlestickItem(pg.GraphicsObject):
@@ -33,6 +78,7 @@ class CandlestickItem(pg.GraphicsObject):
         self._ts_cache: List[float] = []
         self._chunk_size = 300
         self._chunk_cache: dict[int, QPicture] = {}
+        self._line_chunk_cache: dict[int, QPicture] = {}
         self._pen_up = pg.mkPen(self.base_color, width=1)
         self._pen_down = pg.mkPen(self.down_color, width=1)
         self._brush_up = pg.mkBrush(self.base_color)
@@ -40,7 +86,29 @@ class CandlestickItem(pg.GraphicsObject):
         self._pen_cache: dict[tuple[int, int, int, int], pg.QtGui.QPen] = {}
         self._brush_cache: dict[tuple[int, int, int, int], pg.QtGui.QBrush] = {}
         self._render_callback = render_callback
+        self._bounds_min: Optional[float] = None
+        self._bounds_max: Optional[float] = None
+        self._bounds_dirty = True
+        self._x: Optional[np.ndarray] = None
+        self._open: Optional[np.ndarray] = None
+        self._high: Optional[np.ndarray] = None
+        self._low: Optional[np.ndarray] = None
+        self._close: Optional[np.ndarray] = None
         self.generate_picture()
+
+    def set_candle_width(self, width_ms: float) -> None:
+        if width_ms <= 0:
+            return
+        if abs(width_ms - self.candle_width_ms) < 1.0:
+            return
+        self.candle_width_ms = width_ms
+        self._chunk_cache = {}
+        self._line_chunk_cache = {}
+        self._bounds_dirty = True
+        try:
+            self.update()
+        except RuntimeError:
+            pass
 
     def _get_pen(self, color: QColor) -> pg.QtGui.QPen:
         try:
@@ -72,33 +140,28 @@ class CandlestickItem(pg.GraphicsObject):
             self.picture = QPicture()
             if len(self.data) == 0:
                 self._cached_bounds = QRectF(0, 0, 1, 1)
+                self._bounds_dirty = False
+                return
+            if not self._bounds_dirty and self._cached_bounds is not None:
                 return
             w = (self.candle_width_ms / 2.0) if self.candle_width_ms else 0.3
-            y_min = float('inf')
-            y_max = float('-inf')
-            x_min = float('inf')
-            x_max = float('-inf')
-            for candle in self.data:
-                if len(candle) < 5:
-                    continue
-                try:
-                    x_val = float(candle[0])
-                    high = float(candle[2])
-                    low = float(candle[3])
-                except (ValueError, TypeError):
-                    continue
-                if low <= 0 or high <= 0:
-                    continue
-                if not (np.isfinite(low) and np.isfinite(high)):
-                    continue
-                y_min = min(y_min, low)
-                y_max = max(y_max, high)
-                x_min = min(x_min, x_val - w)
-                x_max = max(x_max, x_val + w)
-            if y_min != float('inf') and y_max != float('-inf'):
-                self._cached_bounds = QRectF(x_min, y_min, x_max - x_min, y_max - y_min)
+            if self._low is not None and self._high is not None and self._x is not None:
+                mask = np.isfinite(self._low) & np.isfinite(self._high) & (self._low > 0) & (self._high > 0)
+                if np.any(mask):
+                    y_min = float(np.nanmin(self._low[mask]))
+                    y_max = float(np.nanmax(self._high[mask]))
+                    x_min = float(np.nanmin(self._x[mask])) - w
+                    x_max = float(np.nanmax(self._x[mask])) + w
+                    self._cached_bounds = QRectF(x_min, y_min, x_max - x_min, y_max - y_min)
+                    self._bounds_min = y_min
+                    self._bounds_max = y_max
+                    self._bounds_dirty = False
+                else:
+                    self._cached_bounds = QRectF(0, 0, 1, 1)
+                    self._bounds_dirty = False
             else:
                 self._cached_bounds = QRectF(0, 0, 1, 1)
+                self._bounds_dirty = False
         finally:
             self._is_painting = False
 
@@ -126,34 +189,21 @@ class CandlestickItem(pg.GraphicsObject):
                 start_idx, end_idx = 0, len(self.data)
             visible_count = max(0, end_idx - start_idx)
             if visible_count > 750:
-                for idx in range(start_idx, end_idx):
-                    candle = self.data[idx]
-                    if len(candle) < 5:
-                        continue
-                    try:
-                        x_val = float(candle[0])
-                        open_price = float(candle[1])
-                        high = float(candle[2])
-                        low = float(candle[3])
-                        close = float(candle[4])
-                    except (ValueError, TypeError):
-                        continue
-                    if low <= 0 or high <= 0 or open_price <= 0 or close <= 0:
-                        continue
-                    if not (np.isfinite(low) and np.isfinite(high)):
-                        continue
-                    if len(self.bar_colors) > 0 and idx < len(self.bar_colors) and self.bar_colors[idx] is not None:
-                        painter.setPen(self._get_pen(self.bar_colors[idx]))
-                    else:
-                        painter.setPen(self._pen_down if close < open_price else self._pen_up)
-                    painter.drawLine(QPointF(x_val, low), QPointF(x_val, high))
+                chunk_start = start_idx // self._chunk_size
+                chunk_end = (end_idx - 1) // self._chunk_size if end_idx > 0 else chunk_start
+                for chunk_idx in range(chunk_start, chunk_end + 1):
+                    picture = self._line_chunk_cache.get(chunk_idx)
+                    if picture is None:
+                        picture = self._render_chunk(chunk_idx, w, line_mode=True)
+                        self._line_chunk_cache[chunk_idx] = picture
+                    painter.drawPicture(0, 0, picture)
                 return
             chunk_start = start_idx // self._chunk_size
             chunk_end = (end_idx - 1) // self._chunk_size if end_idx > 0 else chunk_start
             for chunk_idx in range(chunk_start, chunk_end + 1):
                 picture = self._chunk_cache.get(chunk_idx)
                 if picture is None:
-                    picture = self._render_chunk(chunk_idx, w)
+                    picture = self._render_chunk(chunk_idx, w, line_mode=False)
                     self._chunk_cache[chunk_idx] = picture
                 painter.drawPicture(0, 0, picture)
         except RuntimeError:
@@ -187,11 +237,45 @@ class CandlestickItem(pg.GraphicsObject):
         previous_len = len(self.data)
         self.data = data
         self._ts_cache = []
+        try:
+            arr = np.asarray(self.data, dtype=np.float64)
+            if arr.ndim == 2 and arr.shape[1] >= 5:
+                self._x = arr[:, 0]
+                self._open = arr[:, 1]
+                self._high = arr[:, 2]
+                self._low = arr[:, 3]
+                self._close = arr[:, 4]
+            else:
+                self._x = None
+                self._open = None
+                self._high = None
+                self._low = None
+                self._close = None
+        except Exception:
+            self._x = None
+            self._open = None
+            self._high = None
+            self._low = None
+            self._close = None
         if invalidate_from_idx is None or len(self.data) < previous_len:
             self._chunk_cache = {}
+            self._line_chunk_cache = {}
+            self._bounds_dirty = True
         else:
             start_chunk = max(0, int(invalidate_from_idx) // self._chunk_size)
             self._chunk_cache = {k: v for k, v in self._chunk_cache.items() if k < start_chunk}
+            self._line_chunk_cache = {k: v for k, v in self._line_chunk_cache.items() if k < start_chunk}
+            if self._low is not None and self._high is not None:
+                try:
+                    lo = float(np.nanmin(self._low[invalidate_from_idx:]))
+                    hi = float(np.nanmax(self._high[invalidate_from_idx:]))
+                    if self._bounds_min is None or self._bounds_max is None:
+                        self._bounds_dirty = True
+                    else:
+                        if lo < self._bounds_min or hi > self._bounds_max:
+                            self._bounds_dirty = True
+                except Exception:
+                    self._bounds_dirty = True
         for candle in self.data:
             if len(candle) < 1:
                 continue
@@ -200,34 +284,43 @@ class CandlestickItem(pg.GraphicsObject):
             except (ValueError, TypeError):
                 ts = 0.0
             self._ts_cache.append(ts)
+        bounds_was_dirty = self._bounds_dirty
         self.generate_picture()
-        try:
-            self.informViewBoundsChanged()
-        except RuntimeError:
-            pass
+        if bounds_was_dirty:
+            try:
+                self.informViewBoundsChanged()
+            except RuntimeError:
+                pass
         try:
             self.update()
         except RuntimeError:
             pass
 
-    def _render_chunk(self, chunk_idx: int, w: float) -> QPicture:
+    def _render_chunk(self, chunk_idx: int, w: float, line_mode: bool = False) -> QPicture:
         picture = QPicture()
         painter = QPainter(picture)
         try:
             start_idx = chunk_idx * self._chunk_size
             end_idx = min(len(self.data), start_idx + self._chunk_size)
             for idx in range(start_idx, end_idx):
-                candle = self.data[idx]
-                if len(candle) < 5:
-                    continue
-                try:
-                    x_val = float(candle[0])
-                    open_price = float(candle[1])
-                    high = float(candle[2])
-                    low = float(candle[3])
-                    close = float(candle[4])
-                except (ValueError, TypeError):
-                    continue
+                if self._x is not None and self._open is not None and self._high is not None and self._low is not None and self._close is not None:
+                    x_val = float(self._x[idx])
+                    open_price = float(self._open[idx])
+                    high = float(self._high[idx])
+                    low = float(self._low[idx])
+                    close = float(self._close[idx])
+                else:
+                    candle = self.data[idx]
+                    if len(candle) < 5:
+                        continue
+                    try:
+                        x_val = float(candle[0])
+                        open_price = float(candle[1])
+                        high = float(candle[2])
+                        low = float(candle[3])
+                        close = float(candle[4])
+                    except (ValueError, TypeError):
+                        continue
                 if low <= 0 or high <= 0 or open_price <= 0 or close <= 0:
                     continue
                 if not (np.isfinite(low) and np.isfinite(high) and np.isfinite(open_price) and np.isfinite(close)):
@@ -250,19 +343,23 @@ class CandlestickItem(pg.GraphicsObject):
                     current_color = self.down_color if is_bear else self.base_color
 
                 wick_pen = self._get_pen(current_color)
-                body_pen = self._get_pen(current_color)
-                painter.setBrush(self._get_brush(current_color))
-                if high != low:
+                if line_mode:
                     painter.setPen(wick_pen)
                     painter.drawLine(QPointF(x_val, low), QPointF(x_val, high))
-                painter.setPen(body_pen)
-                body_top = max(open_price, close)
-                body_bottom = min(open_price, close)
-                body_height = body_top - body_bottom
-                if body_height > 0:
-                    painter.drawRect(QRectF(x_val - w, body_bottom, w * 2, body_height))
                 else:
-                    painter.drawLine(QPointF(x_val - w, close), QPointF(x_val + w, close))
+                    body_pen = self._get_pen(current_color)
+                    painter.setBrush(self._get_brush(current_color))
+                    if high != low:
+                        painter.setPen(wick_pen)
+                        painter.drawLine(QPointF(x_val, low), QPointF(x_val, high))
+                    painter.setPen(body_pen)
+                    body_top = max(open_price, close)
+                    body_bottom = min(open_price, close)
+                    body_height = body_top - body_bottom
+                    if body_height > 0:
+                        painter.drawRect(QRectF(x_val - w, body_bottom, w * 2, body_height))
+                    else:
+                        painter.drawLine(QPointF(x_val - w, close), QPointF(x_val + w, close))
         finally:
             painter.end()
         return picture
@@ -277,6 +374,19 @@ class CandlestickChart:
         self.bar_colors: List[Optional[QColor]] = []
         self.volume_item: Optional[object] = None
         self.volume_max: float = 0.0
+        self._volume_worker: Optional[VolumePrepWorker] = None
+        self._pending_volume_data: Optional[List[Iterable[float]]] = None
+        self._volume_worker_seq = 0
+        self._volume_worker_last_ms = 0
+        self._volume_data_key: Optional[Tuple[int, int]] = None
+        self._volume_live_interval_ms = 2000
+        self._volume_live_updates_enabled = True
+        self._last_volume_live_update_ms = 0
+        self._volume_view_timer = QTimer()
+        self._volume_view_timer.setSingleShot(True)
+        self._volume_view_timer.timeout.connect(self._flush_volume_view)
+        self._volume_view_delay_ms = 180
+        self._bulk_update = False
         self.price_line: Optional[pg.InfiniteLine] = None
         self.price_label: Optional[pg.QtWidgets.QGraphicsTextItem] = None
         self.price_label_bg: Optional[pg.QtWidgets.QGraphicsPathItem] = None
@@ -289,6 +399,7 @@ class CandlestickChart:
         self.price_tick: Optional[pg.QtWidgets.QGraphicsLineItem] = None
         self.session_lines: List[pg.InfiniteLine] = []
         self.volume_baseline: Optional[pg.InfiniteLine] = None
+        self._volume_baseline_y: Optional[float] = None
         self._hover_index: Optional[int] = None
         self.timeframe_ms: Optional[int] = None
         self.last_kline_ts_ms: Optional[int] = None
@@ -301,6 +412,11 @@ class CandlestickChart:
         self._last_trade_update_ms: int = 0
         self._live_price: Optional[float] = None
         self._live_open: Optional[float] = None
+        self._last_live_snapshot: Optional[Tuple[int, float, float, float, float, float]] = None
+        self._live_redraw_timer = QTimer()
+        self._live_redraw_timer.setSingleShot(True)
+        self._live_redraw_timer.timeout.connect(self._flush_live_redraw)
+        self._live_redraw_delay_ms = 40
         self.hover_label: Optional[pg.QtWidgets.QGraphicsTextItem] = None
         self.hover_label_bg: Optional[pg.QtWidgets.QGraphicsPathItem] = None
         self.hover_outline: Optional[pg.QtWidgets.QGraphicsRectItem] = None
@@ -324,6 +440,12 @@ class CandlestickChart:
         self._fast_mode_timer = QTimer()
         self._fast_mode_timer.setSingleShot(True)
         self._fast_mode_timer.timeout.connect(self._disable_fast_mode)
+        self._mouse_move_timer = QTimer()
+        self._mouse_move_timer.setSingleShot(True)
+        self._mouse_move_timer.timeout.connect(self._flush_mouse_move)
+        self._mouse_move_delay_ms = 30
+        self._pending_mouse_pos = None
+        self._session_signature: Optional[Tuple[int, int]] = None
 
         self.plot_widget.setClipToView(True)
         try:
@@ -616,13 +738,14 @@ class CandlestickChart:
         new_width = base_width * scale
         if abs(new_width - self._candle_width_ms) >= 1.0:
             self._candle_width_ms = new_width
-            self.item.candle_width_ms = new_width
+            self.item.set_candle_width(new_width)
 
     def _on_view_changed(self) -> None:
         self._enable_fast_mode()
         if self._view_redraw_timer.isActive():
             return
         self._view_redraw_timer.start(50)
+        self._schedule_volume_view_update()
 
     def _enable_fast_mode(self) -> None:
         if self._fast_mode:
@@ -649,8 +772,6 @@ class CandlestickChart:
             self._update_candle_width_from_view()
             self.item.generate_picture()
             self.item.update()
-            if self.volume_item and self.candles:
-                self._update_volume_histogram(self.candles)
             self._update_price_line()
             self._update_history_end_label()
             self._update_header_position()
@@ -661,43 +782,144 @@ class CandlestickChart:
         except Exception:
             pass
 
+    def _schedule_volume_view_update(self) -> None:
+        if self.volume_item is None:
+            return
+        if self._volume_view_timer.isActive():
+            return
+        self._volume_view_timer.start(self._volume_view_delay_ms)
+
+    def _flush_volume_view(self) -> None:
+        if self.volume_item is None:
+            return
+        try:
+            view_box = self.plot_widget.getViewBox()
+            if view_box is None:
+                return
+            x_range, y_range = view_box.viewRange()
+            x_min, x_max = x_range
+            y_min, y_max = y_range
+        except Exception:
+            return
+        if isinstance(self.volume_item, VolumeHistogramItem):
+            try:
+                self.volume_item.set_view_bounds(x_min, x_max, y_min, y_max)
+            except Exception:
+                pass
+            try:
+                start_idx = max(0, bisect_left(self._ts_cache, x_min) - 10)
+                end_idx = min(len(self._ts_cache), bisect_right(self._ts_cache, x_max) + 10)
+                visible_count = max(0, end_idx - start_idx)
+                step = calculate_lod_step(visible_count, MAX_VISIBLE_BARS_DENSE)
+                if visible_count > 0:
+                    self.volume_item.set_view_hint(x_min, x_max, start_idx, end_idx, step)
+            except Exception:
+                pass
+            self.volume_item.update()
+
     def _update_volume_histogram(self, candles: List[Iterable[float]]) -> None:
-        def extract_volume(candle: Iterable[float], idx: int) -> float:
-            if len(candle) > 5:
-                return float(candle[5]) if candle[5] is not None else 0.0
-            return 0.0
+        if not candles:
+            volume_color = QColor(self.base_color)
+            bar_width = (self.timeframe_ms or 60_000) * 0.8
+            self.volume_item, self.volume_max = update_volume_histogram(
+                plot_widget=self.plot_widget,
+                volume_item=self.volume_item if isinstance(self.volume_item, VolumeHistogramItem) else None,
+                base_color=volume_color,
+                data=[],
+                extract_volume=lambda *_: 0.0,
+                extract_x=lambda *_: 0.0,
+            )
+            if isinstance(self.volume_item, VolumeHistogramItem):
+                self.volume_item.clear_tail()
+            self._update_volume_baseline()
+            return
+        try:
+            last_ts = int(candles[-1][0])
+        except Exception:
+            last_ts = 0
+        data_key = (len(candles), last_ts)
+        if self._volume_data_key == data_key:
+            return
+        self._volume_data_key = data_key
+        if self._volume_worker and self._volume_worker.isRunning():
+            self._pending_volume_data = candles
+            return
+        self._start_volume_worker(candles)
 
-        def extract_x(candle: Iterable[float], idx: int) -> float:
-            try:
-                return float(candle[0])
-            except (ValueError, TypeError):
-                return float(idx)
+    def _update_volume_tail(self) -> None:
+        if not isinstance(self.volume_item, VolumeHistogramItem):
+            return
+        if not self.candles:
+            self.volume_item.clear_tail()
+            return
+        try:
+            last = self.candles[-1]
+            ts = float(last[0])
+            vol = float(last[5]) if len(last) > 5 else 0.0
+            is_up = float(last[4]) >= float(last[1])
+        except Exception:
+            return
+        self.volume_item.set_tail(len(self.candles) - 1, ts, vol, is_up)
 
-        def extract_is_up(candle: Iterable[float], idx: int) -> Optional[bool]:
-            try:
-                open_price = float(candle[1])
-                close_price = float(candle[4])
-            except (ValueError, TypeError, IndexError):
-                return None
-            return close_price >= open_price
+    def _start_volume_worker(self, candles: List[Iterable[float]]) -> None:
+        x_min = None
+        x_max = None
+        try:
+            view_box = self.plot_widget.getViewBox()
+            x_range, _ = view_box.viewRange()
+            x_min, x_max = x_range
+        except Exception:
+            pass
+        self._volume_worker_seq += 1
+        seq = self._volume_worker_seq
+        self._volume_worker_last_start = time.time()
+        self._volume_worker = VolumePrepWorker(candles, x_min, x_max, seq)
+        self._volume_worker.ready.connect(self._on_volume_ready)
+        self._volume_worker.error.connect(self._on_volume_error)
+        self._volume_worker.finished.connect(self._on_volume_finished)
+        self._volume_worker.start()
 
+    def _on_volume_ready(self, seq, x_vals, vol_vals, is_up, view_hint) -> None:
+        if seq != self._volume_worker_seq:
+            return
+        if hasattr(self, "_volume_worker_last_start"):
+            self._volume_worker_last_ms = int((time.time() - self._volume_worker_last_start) * 1000)
+        self._last_volume_live_update_ms = int(time.time() * 1000)
         volume_color = QColor(self.base_color)
         bar_width = (self.timeframe_ms or 60_000) * 0.8
-        self.volume_item, self.volume_max = update_volume_histogram(
+        self.volume_item, self.volume_max = update_volume_histogram_arrays(
             plot_widget=self.plot_widget,
-            volume_item=self.volume_item,
+            volume_item=self.volume_item if isinstance(self.volume_item, VolumeHistogramItem) else None,
             base_color=volume_color,
-            data=candles,
-            extract_volume=extract_volume,
-            extract_x=extract_x,
-            extract_is_up=extract_is_up,
+            x_vals=x_vals,
+            vol_vals=vol_vals,
+            is_up=is_up,
             up_color=self.base_color,
             down_color=self.down_color,
             volume_height_ratio=0.15,
             bar_width=bar_width,
-            flush_bottom=True,
         )
+        if isinstance(self.volume_item, VolumeHistogramItem) and view_hint:
+            start_idx, end_idx, step, x_min, x_max = view_hint
+            self.volume_item.set_view_hint(x_min, x_max, start_idx, end_idx, step)
+        self._update_volume_tail()
+        try:
+            view_box = self.plot_widget.getViewBox()
+            (x_range, y_range) = view_box.viewRange()
+            if isinstance(self.volume_item, VolumeHistogramItem):
+                self.volume_item.set_view_bounds(x_range[0], x_range[1], y_range[0], y_range[1])
+        except Exception:
+            pass
         self._update_volume_baseline()
+
+    def _on_volume_error(self, message: str) -> None:
+        _ = message
+
+    def _on_volume_finished(self) -> None:
+        if self._pending_volume_data is not None:
+            pending = self._pending_volume_data
+            self._pending_volume_data = None
+            self._start_volume_worker(pending)
 
     def _update_volume_baseline(self) -> None:
         try:
@@ -708,6 +930,9 @@ class CandlestickChart:
             visible_y_min = y_range[0]
         except Exception:
             return
+        if self._volume_baseline_y is not None and abs(visible_y_min - self._volume_baseline_y) < 1e-6:
+            return
+        self._volume_baseline_y = visible_y_min
         pen = pg.mkPen(QColor(25, 29, 38, 200), width=1)
         if self.volume_baseline is None:
             self.volume_baseline = pg.InfiniteLine(pos=visible_y_min, angle=0, pen=pen)
@@ -737,37 +962,62 @@ class CandlestickChart:
         if self.empty_label is not None:
             self.empty_label.hide()
 
-    def set_historical_data(self, data: List[Iterable[float]], auto_range: bool = True) -> None:
-        normalized = []
-        for c in data:
-            if not isinstance(c, (list, tuple)) or len(c) < 5:
-                continue
-            ts, o, h, l, cl = c[0], c[1], c[2], c[3], c[4]
-            vol = c[5] if len(c) > 5 else 0.0
-            try:
-                o, h, l, cl = float(o), float(h), float(l), float(cl)
-                if o <= 0 or h <= 0 or l <= 0 or cl <= 0:
+    def set_historical_data(self, data: List[Iterable[float]], auto_range: bool = True, normalized: bool = False) -> None:
+        normalized_data = []
+        if normalized:
+            normalized_data = data
+        else:
+            for c in data:
+                if not isinstance(c, (list, tuple)) or len(c) < 5:
                     continue
-                if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(cl)):
+                ts, o, h, l, cl = c[0], c[1], c[2], c[3], c[4]
+                vol = c[5] if len(c) > 5 else 0.0
+                try:
+                    o, h, l, cl = float(o), float(h), float(l), float(cl)
+                    if o <= 0 or h <= 0 or l <= 0 or cl <= 0:
+                        continue
+                    if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(cl)):
+                        continue
+                except (ValueError, TypeError):
                     continue
-            except (ValueError, TypeError):
-                continue
-            normalized.append([ts, o, h, l, cl, vol])
-        if not normalized:
+                normalized_data.append([ts, o, h, l, cl, vol])
+        if not normalized_data:
             self.candles = []
             self._ts_cache = []
             self.item.set_data([])
             self._update_volume_histogram([])
             self._show_empty_state()
             return
-        self.candles = normalized
+        self.candles = normalized_data
         self._ts_cache = [float(c[0]) for c in self.candles]
         self.item.candle_width_ms = self._candle_width_ms
         self.item.set_data(self.candles, bar_colors=self.bar_colors)
+        if self._bulk_update:
+            self._hide_empty_state()
+            return
         self._update_volume_histogram(self.candles)
+        self._update_volume_tail()
         self._update_price_line()
         self._update_history_end_label()
-        self._clear_session_lines()
+        self._update_session_lines_if_needed()
+        self._refresh_hover_if_needed()
+        self._hide_empty_state()
+        if auto_range:
+            self._auto_range()
+
+    def begin_bulk_update(self) -> None:
+        self._bulk_update = True
+
+    def end_bulk_update(self, auto_range: bool = False) -> None:
+        self._bulk_update = False
+        if not self.candles:
+            self._show_empty_state()
+            return
+        self._update_volume_histogram(self.candles)
+        self._update_volume_tail()
+        self._update_price_line()
+        self._update_history_end_label()
+        self._update_session_lines_if_needed()
         self._refresh_hover_if_needed()
         self._hide_empty_state()
         if auto_range:
@@ -776,7 +1026,7 @@ class CandlestickChart:
     def set_timeframe(self, timeframe: str) -> None:
         self.timeframe_ms = self._parse_timeframe_ms(timeframe)
         self._candle_width_ms = (self.timeframe_ms or 60_000) * 0.8
-        self.item.candle_width_ms = self._candle_width_ms
+        self.item.set_candle_width(self._candle_width_ms)
 
     def update_live_kline(self, kline: dict) -> None:
         try:
@@ -815,15 +1065,7 @@ class CandlestickChart:
             self.time_offset_ms = int(kline.get('time_offset_ms', 0))
         except Exception:
             self.time_offset_ms = 0
-        tail_idx = max(0, len(self.candles) - 2)
-        self.item.set_data(self.candles, bar_colors=self.bar_colors, invalidate_from_idx=tail_idx)
-        self._update_volume_histogram(self.candles)
-        self._update_price_line()
-        self._update_history_end_label()
-        self._clear_session_lines()
-        if not self._fast_mode:
-            self._refresh_hover_if_needed()
-        self._hide_empty_state()
+        self._queue_live_redraw()
 
     def update_live_trade(self, trade: dict) -> None:
         if not self.candles:
@@ -863,12 +1105,52 @@ class CandlestickChart:
         v = v + max(0.0, qty)
         self.candles[-1] = [last_ts, o, h, l, price, v]
 
+        self._queue_live_redraw()
+
+    def _queue_live_redraw(self) -> None:
+        if not self.candles:
+            return
+        last = self.candles[-1]
+        if len(last) < 6:
+            return
+        snapshot = (
+            int(last[0]),
+            float(last[1]),
+            float(last[2]),
+            float(last[3]),
+            float(last[4]),
+            float(last[5]),
+        )
+        if self._last_live_snapshot == snapshot:
+            return
+        self._last_live_snapshot = snapshot
+        if not self._live_redraw_timer.isActive():
+            self._live_redraw_timer.start(self._live_redraw_delay_ms)
+
+    def set_volume_live_updates_enabled(self, enabled: bool) -> None:
+        if self._volume_live_updates_enabled == enabled:
+            return
+        self._volume_live_updates_enabled = enabled
+
+    def _flush_live_redraw(self) -> None:
+        if not self.candles:
+            return
         tail_idx = max(0, len(self.candles) - 2)
         self.item.set_data(self.candles, bar_colors=self.bar_colors, invalidate_from_idx=tail_idx)
-        self._update_volume_histogram(self.candles)
+        now_ms = int(time.time() * 1000)
+        try:
+            last_ts = int(self.candles[-1][0])
+        except Exception:
+            last_ts = 0
+        if self._volume_data_key is None or self._volume_data_key[0] != len(self.candles):
+            self._update_volume_histogram(self.candles)
+        elif self._volume_live_updates_enabled and (now_ms - self._last_volume_live_update_ms) >= self._volume_live_interval_ms:
+            self._volume_data_key = None
+            self._update_volume_histogram(self.candles)
+        self._update_volume_tail()
         self._update_price_line()
         self._update_history_end_label()
-        self._clear_session_lines()
+        self._update_session_lines_if_needed()
         if not self._fast_mode:
             self._refresh_hover_if_needed()
         self._hide_empty_state()
@@ -895,7 +1177,25 @@ class CandlestickChart:
                 span = (self.timeframe_ms or 60_000) * show_candles
             self.plot_widget.setXRange(start_ts - span * 0.05, end_ts + span * 0.05)
 
+    def get_view_index_range(self, margin: int = 10) -> Tuple[Optional[int], Optional[int]]:
+        if not self._ts_cache:
+            return None, None
+        try:
+            view_box = self.plot_widget.getViewBox()
+            x_range, _ = view_box.viewRange()
+            x_min, x_max = x_range
+        except Exception:
+            return None, None
+        try:
+            start_idx = max(0, bisect_left(self._ts_cache, x_min) - margin)
+            end_idx = min(len(self._ts_cache), bisect_right(self._ts_cache, x_max) + margin)
+        except Exception:
+            return None, None
+        return start_idx, end_idx
+
     def set_bar_colors(self, bar_colors: List[Optional[QColor]]) -> None:
+        if bar_colors == self.bar_colors:
+            return
         self.bar_colors = bar_colors
         try:
             self.item.set_data(self.candles, bar_colors=self.bar_colors)
@@ -1300,6 +1600,9 @@ class CandlestickChart:
     def get_render_stats(self) -> tuple[float, int]:
         return self._render_fps, self._last_render_ms
 
+    def get_volume_worker_ms(self) -> int:
+        return int(self._volume_worker_last_ms)
+
     def _index_for_time(self, ts_ms: float) -> Optional[int]:
         if not self._ts_cache:
             return None
@@ -1315,6 +1618,15 @@ class CandlestickChart:
         return pos
 
     def _on_mouse_moved(self, scene_pos) -> None:
+        self._pending_mouse_pos = scene_pos
+        if self._mouse_move_timer.isActive():
+            return
+        self._mouse_move_timer.start(self._mouse_move_delay_ms)
+
+    def _flush_mouse_move(self) -> None:
+        scene_pos = self._pending_mouse_pos
+        if scene_pos is None:
+            return
         if not self.candles:
             return
         if self._fast_mode:
@@ -1412,6 +1724,21 @@ class CandlestickChart:
             except Exception:
                 pass
         self.session_lines = []
+
+    def _update_session_lines_if_needed(self) -> None:
+        if not self.candles:
+            self._clear_session_lines()
+            self._session_signature = None
+            return
+        try:
+            first_day = int(self.candles[0][0] // 86_400_000)
+            last_day = int(self.candles[-1][0] // 86_400_000)
+        except Exception:
+            first_day = last_day = 0
+        sig = (first_day, last_day)
+        if sig != self._session_signature:
+            self._session_signature = sig
+            self._clear_session_lines()
 
     def _ensure_cursor_price_label(self) -> None:
         if self.cursor_price_label is None:

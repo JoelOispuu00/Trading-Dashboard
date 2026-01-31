@@ -2,8 +2,10 @@ import json
 import os
 import time
 import uuid
+from bisect import bisect_left, bisect_right
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Tuple
+import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox, QLabel, QCompleter, QButtonGroup, QTabBar, QStyle, QLineEdit, QMenu
 from PyQt6.QtGui import QFont, QColor, QLinearGradient, QBrush, QIcon
@@ -131,6 +133,158 @@ class HistoryProbeWorker(QThread):
         try:
             earliest = ensure_history_floor(self.store, self.exchange, self.symbol, self.timeframe)
             self.result.emit(self.symbol, self.timeframe, earliest)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class IndicatorComputeWorker(QThread):
+    result = pyqtSignal(int, list)
+    error = pyqtSignal(str)
+
+    def __init__(self, tasks: list, reason: str, seq: int) -> None:
+        super().__init__()
+        self._tasks = tasks
+        self._reason = reason
+        self._seq = seq
+
+    def run(self) -> None:
+        results = []
+        try:
+            for task in self._tasks:
+                instance_id = task.get("instance_id")
+                compute_fn = task.get("compute_fn")
+                bars = task.get("compute_bars") or task.get("bars")
+                params = task.get("params", {})
+                if compute_fn is None or not bars:
+                    continue
+                output, required = run_compute(bars, params, compute_fn)
+                output = self._prep_output_arrays(output or {})
+                results.append({
+                    "instance_id": instance_id,
+                    "output": output or {},
+                    "required": required,
+                    "pane_id": task.get("pane_id", "price"),
+                    "view_key": task.get("view_key"),
+                    "view_idx_key": task.get("view_idx_key"),
+                    "bars": task.get("render_bars") or bars,
+                    "merge": bool(task.get("merge")),
+                    "tail_len": int(task.get("tail_len") or 0),
+                    "bars_key": task.get("bars_key"),
+                    "compute_start_idx": task.get("compute_start_idx"),
+                    "compute_end_idx": task.get("compute_end_idx"),
+                    "reason": self._reason,
+                })
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+        self.result.emit(self._seq, results)
+
+    @staticmethod
+    def _prep_output_arrays(output: Dict[str, Any]) -> Dict[str, Any]:
+        if not output:
+            return output
+        try:
+            series = output.get("series")
+            if isinstance(series, list):
+                for spec in series:
+                    if isinstance(spec, dict) and "values" in spec:
+                        spec["values"] = np.asarray(spec["values"], dtype=np.float64)
+            bands = output.get("bands")
+            if isinstance(bands, list):
+                for spec in bands:
+                    if not isinstance(spec, dict):
+                        continue
+                    if "upper" in spec:
+                        spec["upper"] = np.asarray(spec["upper"], dtype=np.float64)
+                    if "lower" in spec:
+                        spec["lower"] = np.asarray(spec["lower"], dtype=np.float64)
+            hist = output.get("hist")
+            if isinstance(hist, list):
+                for spec in hist:
+                    if isinstance(spec, dict) and "values" in spec:
+                        spec["values"] = np.asarray(spec["values"], dtype=np.float64)
+        except Exception:
+            return output
+        return output
+
+
+class CandleNormalizeWorker(QThread):
+    result = pyqtSignal(int, list, list, int)
+    error = pyqtSignal(str)
+
+    def __init__(self, data: list, auto_range: bool, seq: int) -> None:
+        super().__init__()
+        self._data = data
+        self._auto_range = auto_range
+        self._seq = seq
+
+    def run(self) -> None:
+        normalized = []
+        try:
+            for c in self._data:
+                if not isinstance(c, (list, tuple)) or len(c) < 5:
+                    continue
+                ts, o, h, l, cl = c[0], c[1], c[2], c[3], c[4]
+                vol = c[5] if len(c) > 5 else 0.0
+                try:
+                    o, h, l, cl = float(o), float(h), float(l), float(cl)
+                    if o <= 0 or h <= 0 or l <= 0 or cl <= 0:
+                        continue
+                    if not (np.isfinite(o) and np.isfinite(h) and np.isfinite(l) and np.isfinite(cl)):
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                normalized.append([ts, o, h, l, cl, vol])
+            ts_cache = [float(c[0]) for c in normalized]
+            self.result.emit(self._seq, normalized, ts_cache, int(self._auto_range))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class BackfillDecisionWorker(QThread):
+    result = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        x_min: float,
+        x_max: float,
+        tf_ms: int,
+        current_min_ts: int,
+        current_max_ts: int,
+        oldest_ts: Optional[int],
+        oldest_reached: bool,
+        now_ms: int,
+    ) -> None:
+        super().__init__()
+        self._x_min = x_min
+        self._x_max = x_max
+        self._tf_ms = tf_ms
+        self._current_min_ts = current_min_ts
+        self._current_max_ts = current_max_ts
+        self._oldest_ts = oldest_ts
+        self._oldest_reached = bool(oldest_reached)
+        self._now_ms = now_ms
+
+    def run(self) -> None:
+        try:
+            visible_span = max(1.0, self._x_max - self._x_min)
+            edge_threshold = max(5 * self._tf_ms, visible_span * 0.08)
+            left_at_end = bool(self._oldest_reached and self._oldest_ts is not None and self._current_min_ts <= self._oldest_ts)
+            right_at_end = (self._now_ms - self._current_max_ts) <= edge_threshold
+            left_near = (self._x_min - self._current_min_ts) <= edge_threshold
+            right_near = (self._x_max >= self._current_max_ts - edge_threshold)
+            left_beyond = (self._x_min <= self._current_min_ts - edge_threshold)
+            right_beyond = (self._x_max >= self._current_max_ts + edge_threshold)
+            action = "none"
+            if (left_near or left_beyond) and not left_at_end:
+                action = "left"
+            elif (right_near or right_beyond) and not right_at_end:
+                action = "right"
+            self.result.emit({
+                "action": action,
+                "edge_threshold": edge_threshold,
+            })
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -459,13 +613,21 @@ class ChartView(QWidget):
         self._backfill_debounce_timer = QTimer(self)
         self._backfill_debounce_timer.setSingleShot(True)
         self._backfill_debounce_timer.timeout.connect(self._evaluate_backfill)
+        self._backfill_debounce_ms_normal = 250
+        self._backfill_debounce_ms_zoomed_out = 400
+        self._view_idle_timer = QTimer(self)
+        self._view_idle_timer.setSingleShot(True)
+        self._view_idle_timer.timeout.connect(self._on_view_idle)
+        self._apply_idle_delay_ms = 200
+        self._pending_apply_bars: Optional[list] = None
+        self._pending_apply_auto_range = False
         self._pending_backfill_view: Optional[tuple[float, float]] = None
         self._window_bars = 2000
         self._window_buffer_bars = 500
         self._window_start_ms: Optional[int] = None
         self._window_end_ms: Optional[int] = None
         self._ignore_view_range = False
-        self._max_visible_bars = 5000
+        self._max_visible_bars = 20000
         self._clamp_in_progress = False
         self._fetch_start_ms: Optional[int] = None
         self._last_fetch_duration_ms: Optional[int] = None
@@ -485,14 +647,41 @@ class ChartView(QWidget):
         self._indicator_panes: Dict[str, pg.PlotWidget] = {"price": self.plot_widget}
         self._indicator_hot_reload: Optional[IndicatorHotReloadWorker] = None
         self._indicator_recompute_pending = False
+        self._indicator_recompute_timer = QTimer(self)
+        self._indicator_recompute_timer.setSingleShot(True)
+        self._indicator_recompute_timer.timeout.connect(self._do_recompute_indicators)
+        self._indicator_recompute_debounce_ms = 100
+        self._indicator_max_compute_bars = 2000
+        self._indicator_times_cache: Dict[tuple, np.ndarray] = {}
+        self._last_indicator_view_idx_key: Optional[Tuple[Optional[int], Optional[int]]] = None
+        self._indicator_freeze_visible_bars = 1500
+        self._indicator_idle_ms = 200
+        self._indicator_idle_timer = QTimer(self)
+        self._indicator_idle_timer.setSingleShot(True)
+        self._indicator_idle_timer.timeout.connect(self._on_indicator_idle)
+        self._indicator_compute_worker: Optional[IndicatorComputeWorker] = None
+        self._indicator_compute_pending = False
+        self._indicator_last_output: Dict[str, Dict[str, object]] = {}
+        self._indicator_cache: Dict[str, Dict[str, Any]] = {}
+        self._indicator_compute_seq = 0
+        self._indicator_compute_last_ms = 0
+        self._candle_normalize_worker: Optional[CandleNormalizeWorker] = None
+        self._pending_normalize: Optional[tuple[list, bool]] = None
+        self._candle_normalize_seq = 0
+        self._candle_normalize_last_ms = 0
+        self._candle_normalize_merge: Dict[int, Dict[str, object]] = {}
+        self._backfill_decision_worker: Optional[BackfillDecisionWorker] = None
+        self._backfill_decision_last_ms = 0
         self._indicator_next_pane_index = 1
+        self._last_live_indicator_ms = 0
+        self._last_visible_bars = 0
 
     def _setup_indicator_system(self) -> None:
         self._load_indicator_definitions()
         self._load_indicator_instances()
         self._wire_indicator_panel()
         self._start_indicator_hot_reload()
-        self._recompute_indicators()
+        self._recompute_indicators(immediate=True, reason="view")
 
     def _load_indicator_definitions(self) -> None:
         indicators = discover_indicators(self._indicator_paths)
@@ -509,8 +698,307 @@ class ChartView(QWidget):
             poll_interval=1.0,
         )
 
+    def _start_indicator_compute_worker(self, tasks: list, reason: str) -> None:
+        self._indicator_compute_seq += 1
+        seq = self._indicator_compute_seq
+        self._indicator_compute_last_start = time.time()
+        worker = IndicatorComputeWorker(tasks, reason, seq)
+        self._indicator_compute_worker = worker
+        worker.result.connect(self._on_indicator_compute_result)
+        worker.error.connect(self._on_indicator_error)
+        worker.finished.connect(self._on_indicator_compute_finished)
+        worker.start()
+
+    def _on_indicator_compute_result(self, seq: int, results: list) -> None:
+        if seq != self._indicator_compute_seq:
+            return
+        if hasattr(self, "_indicator_compute_last_start"):
+            self._indicator_compute_last_ms = int((time.time() - self._indicator_compute_last_start) * 1000)
+        for result in results:
+            instance_id = str(result.get("instance_id"))
+            output = result.get("output") or {}
+            pane_id = result.get("pane_id", "price")
+            view_key = result.get("view_key")
+            view_idx_key = result.get("view_idx_key")
+            bars = result.get("bars") or []
+            merge = bool(result.get("merge"))
+            tail_len = int(result.get("tail_len") or 0)
+            bars_key = result.get("bars_key")
+            compute_start = result.get("compute_start_idx")
+            compute_end = result.get("compute_end_idx")
+            instance = self._find_indicator_instance(instance_id)
+            if instance is None:
+                continue
+            instance["required_lookback"] = result.get("required", 0)
+            instance["last_view_key"] = view_key
+            instance["last_view_idx_key"] = view_idx_key
+            if merge:
+                prev = self._indicator_last_output.get(instance_id)
+                output = self._merge_indicator_output(prev, output, tail_len)
+                if tail_len > 0:
+                    output = dict(output)
+                    output["_tail_len"] = tail_len
+            if bars_key and compute_start is not None and compute_end is not None:
+                cache = self._ensure_indicator_cache(instance_id, bars_key, len(bars))
+                self._apply_output_to_cache(cache, output, compute_start, compute_end)
+            elif bars_key:
+                self._ensure_indicator_cache(instance_id, bars_key, len(bars))
+            self._indicator_last_output[instance_id] = output
+            renderer = self._indicator_renderers.get(pane_id)
+            if renderer:
+                times = None
+                if view_key is not None:
+                    cached = self._indicator_times_cache.get(view_key)
+                    if cached is not None and cached.size == len(bars):
+                        times = cached
+                if times is None:
+                    try:
+                        times = np.asarray([float(b[0]) for b in bars], dtype=np.float64)
+                    except Exception:
+                        times = None
+                    if times is not None and view_key is not None:
+                        self._indicator_times_cache[view_key] = times
+                if times is not None:
+                    renderer.render((bars, times), output or {}, namespace=instance_id)
+                else:
+                    renderer.render(bars, output or {}, namespace=instance_id)
+
+    def _on_indicator_compute_finished(self) -> None:
+        if self._indicator_compute_pending:
+            self._indicator_compute_pending = False
+            self._recompute_indicators(immediate=True, reason="view")
+
+    def _merge_indicator_output(self, prev: Optional[Dict[str, Any]], new: Dict[str, Any], tail_len: int) -> Dict[str, Any]:
+        if not prev or tail_len <= 0:
+            return new
+        if any(prev.get(key) for key in ("markers", "regions", "levels")):
+            return new
+        if any(new.get(key) for key in ("markers", "regions", "levels")):
+            return new
+
+        def merge_values(prev_vals, new_vals):
+            prev_arr = np.asarray(prev_vals, dtype=np.float64)
+            new_arr = np.asarray(new_vals, dtype=np.float64)
+            if prev_arr.size == 0 or new_arr.size == 0:
+                return prev_vals
+            if prev_arr.size < tail_len:
+                return new_vals
+            new_tail = new_arr[-tail_len:]
+            merged = prev_arr.copy()
+            merged[-tail_len:] = new_tail
+            return merged.tolist()
+
+        merged = dict(prev)
+        merged["series"] = []
+        for spec in prev.get("series", []):
+            spec_id = spec.get("id")
+            new_spec = next((s for s in new.get("series", []) if s.get("id") == spec_id), None)
+            if new_spec and "values" in new_spec:
+                spec = dict(spec)
+                spec["values"] = merge_values(spec.get("values", []), new_spec.get("values", []))
+            merged["series"].append(spec)
+
+        merged["bands"] = []
+        for spec in prev.get("bands", []):
+            spec_id = spec.get("id")
+            new_spec = next((s for s in new.get("bands", []) if s.get("id") == spec_id), None)
+            if new_spec and "upper" in new_spec and "lower" in new_spec:
+                spec = dict(spec)
+                spec["upper"] = merge_values(spec.get("upper", []), new_spec.get("upper", []))
+                spec["lower"] = merge_values(spec.get("lower", []), new_spec.get("lower", []))
+            merged["bands"].append(spec)
+
+        merged["hist"] = []
+        for spec in prev.get("hist", []):
+            spec_id = spec.get("id")
+            new_spec = next((s for s in new.get("hist", []) if s.get("id") == spec_id), None)
+            if new_spec and "values" in new_spec:
+                spec = dict(spec)
+                spec["values"] = merge_values(spec.get("values", []), new_spec.get("values", []))
+            merged["hist"].append(spec)
+        return merged
+
+    def _ensure_indicator_cache(self, instance_id: str, bars_key: Tuple[int, float, float], length: int) -> Dict[str, Any]:
+        cache = self._indicator_cache.get(instance_id)
+        if cache is None or cache.get("bars_key") != bars_key:
+            cache = {
+                "bars_key": bars_key,
+                "length": length,
+                "mask": np.zeros(length, dtype=bool),
+                "series": {},
+                "series_meta": {},
+                "bands": {},
+                "bands_meta": {},
+                "hist": {},
+                "hist_meta": {},
+                "markers": [],
+                "regions": [],
+                "levels": [],
+            }
+            self._indicator_cache[instance_id] = cache
+            return cache
+        current_len = int(cache.get("length", 0) or 0)
+        if current_len != length:
+            delta = length - current_len
+            if delta > 0:
+                cache["mask"] = np.concatenate([cache["mask"], np.zeros(delta, dtype=bool)])
+                for key, arr in cache["series"].items():
+                    cache["series"][key] = np.concatenate([arr, np.full(delta, np.nan)])
+                for key, band in cache["bands"].items():
+                    band["upper"] = np.concatenate([band["upper"], np.full(delta, np.nan)])
+                    band["lower"] = np.concatenate([band["lower"], np.full(delta, np.nan)])
+                for key, arr in cache["hist"].items():
+                    cache["hist"][key] = np.concatenate([arr, np.full(delta, np.nan)])
+            else:
+                cache["mask"] = cache["mask"][:length]
+                for key, arr in cache["series"].items():
+                    cache["series"][key] = arr[:length]
+                for key, band in cache["bands"].items():
+                    band["upper"] = band["upper"][:length]
+                    band["lower"] = band["lower"][:length]
+                for key, arr in cache["hist"].items():
+                    cache["hist"][key] = arr[:length]
+            cache["length"] = length
+        return cache
+
+    @staticmethod
+    def _is_range_cached(mask: np.ndarray, start_idx: Optional[int], end_idx: Optional[int]) -> bool:
+        if start_idx is None or end_idx is None:
+            return False
+        if end_idx <= start_idx:
+            return False
+        try:
+            return bool(mask[start_idx:end_idx].all())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ensure_segment(values: Any, length: int) -> np.ndarray:
+        if isinstance(values, np.ndarray):
+            arr = np.asarray(values, dtype=np.float64)
+        else:
+            arr = np.asarray(list(values), dtype=np.float64)
+        if arr.size < length:
+            pad = np.full(length - arr.size, np.nan, dtype=np.float64)
+            arr = np.concatenate([pad, arr])
+        elif arr.size > length:
+            arr = arr[-length:]
+        return arr
+
+    def _apply_output_to_cache(self, cache: Dict[str, Any], output: Dict[str, Any], start_idx: int, end_idx: int) -> None:
+        length = int(cache.get("length", 0) or 0)
+        if length <= 0:
+            return
+        start_idx = max(0, int(start_idx))
+        end_idx = min(length, int(end_idx))
+        if end_idx <= start_idx:
+            return
+        seg_len = end_idx - start_idx
+        cache["mask"][start_idx:end_idx] = True
+        series = output.get("series")
+        if isinstance(series, list):
+            for spec in series:
+                if not isinstance(spec, dict):
+                    continue
+                series_id = str(spec.get("id", "series"))
+                values = self._ensure_segment(spec.get("values", []), seg_len)
+                arr = cache["series"].get(series_id)
+                if arr is None or arr.size != length:
+                    arr = np.full(length, np.nan, dtype=np.float64)
+                arr[start_idx:end_idx] = values
+                cache["series"][series_id] = arr
+                meta = dict(spec)
+                meta.pop("values", None)
+                meta["id"] = series_id
+                cache["series_meta"][series_id] = meta
+        bands = output.get("bands")
+        if isinstance(bands, list):
+            for spec in bands:
+                if not isinstance(spec, dict):
+                    continue
+                band_id = str(spec.get("id", "band"))
+                upper = self._ensure_segment(spec.get("upper", []), seg_len)
+                lower = self._ensure_segment(spec.get("lower", []), seg_len)
+                band = cache["bands"].get(band_id)
+                if band is None or band.get("upper") is None or band["upper"].size != length:
+                    band = {"upper": np.full(length, np.nan, dtype=np.float64), "lower": np.full(length, np.nan, dtype=np.float64)}
+                band["upper"][start_idx:end_idx] = upper
+                band["lower"][start_idx:end_idx] = lower
+                cache["bands"][band_id] = band
+                meta = dict(spec)
+                meta.pop("upper", None)
+                meta.pop("lower", None)
+                meta["id"] = band_id
+                cache["bands_meta"][band_id] = meta
+        hist = output.get("hist")
+        if isinstance(hist, list):
+            for spec in hist:
+                if not isinstance(spec, dict):
+                    continue
+                hist_id = str(spec.get("id", "hist"))
+                values = self._ensure_segment(spec.get("values", []), seg_len)
+                arr = cache["hist"].get(hist_id)
+                if arr is None or arr.size != length:
+                    arr = np.full(length, np.nan, dtype=np.float64)
+                arr[start_idx:end_idx] = values
+                cache["hist"][hist_id] = arr
+                meta = dict(spec)
+                meta.pop("values", None)
+                meta["id"] = hist_id
+                cache["hist_meta"][hist_id] = meta
+        if output.get("markers") is not None:
+            cache["markers"] = output.get("markers", [])
+        if output.get("regions") is not None:
+            cache["regions"] = output.get("regions", [])
+        if output.get("levels") is not None:
+            cache["levels"] = output.get("levels", [])
+
+    def _build_output_from_cache(self, cache: Dict[str, Any], start_idx: int, end_idx: int) -> Dict[str, Any]:
+        start_idx = max(0, int(start_idx))
+        end_idx = max(start_idx, int(end_idx))
+        series_specs = []
+        for series_id, meta in cache.get("series_meta", {}).items():
+            arr = cache["series"].get(series_id)
+            if arr is None:
+                continue
+            spec = dict(meta)
+            spec["values"] = arr[start_idx:end_idx]
+            series_specs.append(spec)
+        band_specs = []
+        for band_id, meta in cache.get("bands_meta", {}).items():
+            band = cache["bands"].get(band_id)
+            if band is None:
+                continue
+            spec = dict(meta)
+            spec["upper"] = band["upper"][start_idx:end_idx]
+            spec["lower"] = band["lower"][start_idx:end_idx]
+            band_specs.append(spec)
+        hist_specs = []
+        for hist_id, meta in cache.get("hist_meta", {}).items():
+            arr = cache["hist"].get(hist_id)
+            if arr is None:
+                continue
+            spec = dict(meta)
+            spec["values"] = arr[start_idx:end_idx]
+            hist_specs.append(spec)
+        output: Dict[str, Any] = {}
+        if series_specs:
+            output["series"] = series_specs
+        if band_specs:
+            output["bands"] = band_specs
+        if hist_specs:
+            output["hist"] = hist_specs
+        if cache.get("markers"):
+            output["markers"] = cache.get("markers", [])
+        if cache.get("regions"):
+            output["regions"] = cache.get("regions", [])
+        if cache.get("levels"):
+            output["levels"] = cache.get("levels", [])
+        return output
+
     def _on_indicators_updated(self, indicators: List[IndicatorInfo]) -> None:
         self._indicator_defs = {info.indicator_id: info for info in indicators}
+        self._indicator_cache.clear()
         for instance in self._indicator_instances:
             indicator_id = instance.get("indicator_id")
             info = self._indicator_defs.get(indicator_id)
@@ -518,7 +1006,7 @@ class ChartView(QWidget):
                 instance["info"] = info
                 instance["schema"] = self._build_schema(info)
         self._update_indicator_panel()
-        self._recompute_indicators()
+        self._recompute_indicators(immediate=True, reason="params")
 
     def _on_indicator_error(self, message: str) -> None:
         self._report_error(f'Indicator reload failed: {message}')
@@ -703,9 +1191,10 @@ class ChartView(QWidget):
             "last_output": None,
         }
         self._indicator_instances.append(instance)
+        self._clear_indicator_cache(instance_id)
         self._persist_indicator_instance(instance)
         self._update_indicator_panel()
-        self._recompute_indicators()
+        self._recompute_indicators(immediate=True, reason="params")
 
     def _select_indicator_instance(self, instance_id: str) -> None:
         _ = instance_id
@@ -719,6 +1208,7 @@ class ChartView(QWidget):
         if renderer:
             renderer.clear_namespace(instance_id)
         self._indicator_instances = [inst for inst in self._indicator_instances if inst.get("instance_id") != instance_id]
+        self._clear_indicator_cache(instance_id)
         self.store.delete_indicator_instance(instance_id)
         self._cleanup_empty_panes()
         self._update_indicator_panel()
@@ -736,15 +1226,16 @@ class ChartView(QWidget):
                 renderer.clear_namespace(instance_id)
         self._update_indicator_panel()
         if visible:
-            self._recompute_indicators()
+            self._recompute_indicators(immediate=True, reason="params")
 
     def _update_indicator_params(self, instance_id: str, params: dict) -> None:
         instance = self._find_indicator_instance(instance_id)
         if instance is None:
             return
         instance["params"] = params
+        self._clear_indicator_cache(instance_id)
         self._persist_indicator_instance(instance)
-        self._recompute_indicators()
+        self._recompute_indicators(immediate=True, reason="params")
 
     def _move_indicator_instance(self, instance_id: str, pane_id: str) -> None:
         instance = self._find_indicator_instance(instance_id)
@@ -755,13 +1246,14 @@ class ChartView(QWidget):
             return
         self._ensure_indicator_pane(pane_id)
         instance["pane_id"] = pane_id
+        self._clear_indicator_cache(instance_id)
         self._persist_indicator_instance(instance)
         renderer = self._indicator_renderers.get(old_pane)
         if renderer:
             renderer.clear_namespace(instance_id)
         self._cleanup_empty_panes()
         self._update_indicator_panel()
-        self._recompute_indicators()
+        self._recompute_indicators(immediate=True, reason="params")
 
     def _reset_indicator_defaults(self, instance_id: str) -> None:
         instance = self._find_indicator_instance(instance_id)
@@ -770,15 +1262,19 @@ class ChartView(QWidget):
         schema = instance.get("schema") or {}
         params = self._merge_params(schema.get("inputs", {}), "")
         instance["params"] = params
+        self._clear_indicator_cache(instance_id)
         self._persist_indicator_instance(instance)
         self._update_indicator_panel()
-        self._recompute_indicators()
+        self._recompute_indicators(immediate=True, reason="params")
 
     def _find_indicator_instance(self, instance_id: str) -> Optional[Dict[str, object]]:
         for instance in self._indicator_instances:
             if instance.get("instance_id") == instance_id:
                 return instance
         return None
+
+    def _clear_indicator_cache(self, instance_id: str) -> None:
+        self._indicator_cache.pop(instance_id, None)
 
     def _persist_indicator_instance(self, instance: Dict[str, object]) -> None:
         try:
@@ -811,19 +1307,49 @@ class ChartView(QWidget):
                     except Exception:
                         pass
 
-    def _recompute_indicators(self) -> None:
+    def _recompute_indicators(self, immediate: bool = True, reason: str = "view") -> None:
+        if reason == "live" and self._last_visible_bars >= self._indicator_freeze_visible_bars:
+            return
         if self._indicator_recompute_pending:
             return
         self._indicator_recompute_pending = True
-        QTimer.singleShot(0, self._do_recompute_indicators)
+        self._indicator_recompute_reason = reason
+        if reason == "view" and self._last_visible_bars >= self._indicator_freeze_visible_bars and not immediate:
+            return
+        if immediate:
+            self._indicator_recompute_timer.stop()
+            QTimer.singleShot(0, self._do_recompute_indicators)
+        else:
+            self._indicator_recompute_timer.start(self._indicator_recompute_debounce_ms)
 
-    def _do_recompute_indicators(self) -> None:
+    def _do_recompute_indicators(self, force: bool = False) -> None:
         self._indicator_recompute_pending = False
         if self._initial_load_pending:
             return
         bars = getattr(self.candles, "candles", [])
         if not bars:
             return
+        bars_key = None
+        try:
+            bars_key = (len(bars), float(bars[0][0]), float(bars[-1][0]))
+        except Exception:
+            bars_key = None
+        view_start_idx, view_end_idx = self.candles.get_view_index_range(margin=10)
+        view_idx_key = (view_start_idx, view_end_idx)
+        reason = getattr(self, "_indicator_recompute_reason", "view")
+        if reason == "view" and view_idx_key == self._last_indicator_view_idx_key and not force:
+            return
+        self._last_indicator_view_idx_key = view_idx_key
+        view_key = None
+        view_bars = bars
+        if view_start_idx is not None and view_end_idx is not None:
+            view_bars = bars[view_start_idx:view_end_idx]
+            if view_bars:
+                try:
+                    view_key = (len(view_bars), float(view_bars[0][0]), float(view_bars[-1][0]))
+                except Exception:
+                    view_key = None
+        tasks = []
         for instance in self._indicator_instances:
             if not instance.get("visible", True):
                 continue
@@ -833,19 +1359,82 @@ class ChartView(QWidget):
             compute_fn = getattr(info.module, "compute", None)
             if compute_fn is None:
                 continue
+            instance_id = str(instance.get("instance_id"))
             params = instance.get("params", {})
-            try:
-                output, required = run_compute(bars, params, compute_fn)
-                instance["required_lookback"] = required
-                if required and len(bars) < required:
-                    continue
-            except Exception as exc:
-                self._report_error(f'Indicator {instance.get("indicator_id")} failed: {exc}')
+            required = int(instance.get("required_lookback", 0) or 0)
+            if bars_key is not None:
+                cache = self._ensure_indicator_cache(instance_id, bars_key, len(bars))
+                if reason == "view" and view_start_idx is not None and view_end_idx is not None:
+                    if self._is_range_cached(cache["mask"], view_start_idx, view_end_idx) and not force:
+                        instance["last_view_key"] = view_key
+                        instance["last_view_idx_key"] = view_idx_key
+                        renderer = self._indicator_renderers.get(instance.get("pane_id", "price"))
+                        if renderer and view_bars:
+                            try:
+                                times = np.asarray([float(b[0]) for b in view_bars], dtype=np.float64)
+                                cached_output = self._build_output_from_cache(cache, view_start_idx, view_end_idx)
+                                if cached_output:
+                                    self._indicator_last_output[instance_id] = cached_output
+                                    renderer.render((view_bars, times), cached_output, namespace=str(instance.get("instance_id")))
+                            except Exception:
+                                pass
+                        continue
+            if view_start_idx is None or view_end_idx is None:
+                slice_bars = bars
+                render_bars = bars
+                compute_start_idx = 0
+                compute_end_idx = len(bars)
+            else:
+                start_idx = max(0, view_start_idx - required)
+                end_idx = max(start_idx, view_end_idx)
+                slice_bars = bars[start_idx:end_idx]
+                render_bars = view_bars
+                compute_start_idx = start_idx
+                compute_end_idx = end_idx
+            merge = False
+            tail_len = 0
+            last_view_key = instance.get("last_view_key")
+            view_changed = view_key is not None and last_view_key != view_key
+            if reason == "view" and instance.get("last_view_idx_key") == view_idx_key and not force:
                 continue
-            pane_id = instance.get("pane_id", "price")
-            renderer = self._indicator_renderers.get(pane_id)
-            if renderer:
-                renderer.render(bars, output or {}, namespace=str(instance.get("instance_id")))
+            if reason == "live" and last_view_key == view_key:
+                prev_output = self._indicator_last_output.get(instance_id)
+                if prev_output:
+                    tail_len = min(len(render_bars), max(required + 2, 20)) if render_bars else 0
+                    if tail_len > 0:
+                        slice_bars = render_bars[-tail_len:]
+                        merge = True
+                        if view_end_idx is not None:
+                            compute_end_idx = view_end_idx
+                            compute_start_idx = max(0, compute_end_idx - len(slice_bars))
+            max_compute = max(self._indicator_max_compute_bars, required + 2)
+            if (reason != "view" and not view_changed) and len(slice_bars) > max_compute:
+                orig_end = compute_end_idx
+                slice_bars = slice_bars[-max_compute:]
+                compute_end_idx = orig_end
+                compute_start_idx = max(0, compute_end_idx - len(slice_bars))
+            tasks.append({
+                "instance_id": instance_id,
+                "compute_fn": compute_fn,
+                "params": params,
+                "compute_bars": slice_bars,
+                "render_bars": render_bars,
+                "pane_id": instance.get("pane_id", "price"),
+                "view_key": view_key,
+                "view_idx_key": view_idx_key,
+                "merge": merge,
+                "tail_len": tail_len,
+                "bars_key": bars_key,
+                "compute_start_idx": compute_start_idx,
+                "compute_end_idx": compute_end_idx,
+            })
+
+        if not tasks:
+            return
+        if self._indicator_compute_worker and self._indicator_compute_worker.isRunning():
+            self._indicator_compute_pending = True
+            return
+        self._start_indicator_compute_worker(tasks, reason=reason)
 
 
     def _load_symbols(self) -> None:
@@ -1179,34 +1768,11 @@ class ChartView(QWidget):
     def _on_data_ready(self, bars: list) -> None:
         if bars:
             try:
-                auto_range = self._last_fetch_mode not in ('backfill', 'window')
-                self._ignore_view_range = True
-                self.candles.set_historical_data(bars, auto_range=auto_range)
-                self._ignore_view_range = False
-                try:
-                    self._window_start_ms = int(bars[0][0])
-                    self._window_end_ms = int(bars[-1][0])
-                except Exception:
-                    pass
-                if self._last_fetch_mode in ('backfill', 'window') and self._pending_backfill_view:
-                    try:
-                        view_box = self.plot_widget.getViewBox()
-                        view_box.setXRange(self._pending_backfill_view[0], self._pending_backfill_view[1], padding=0)
-                    except Exception:
-                        pass
-                    self._pending_backfill_view = None
-                if self._initial_load_pending:
-                    self._apply_pending_live_updates()
-                    self._initial_load_pending = False
+                self._pending_apply_bars = bars
+                self._pending_apply_auto_range = self._last_fetch_mode not in ('backfill', 'window')
+                self._view_idle_timer.start(self._apply_idle_delay_ms)
             except Exception as exc:
-                self._ignore_view_range = False
                 self._report_error(f'Chart render failed: {exc}')
-        self._recompute_indicators()
-        self._refresh_history_end_status()
-        self._emit_debug_state()
-        self._start_live_stream()
-        if self._last_fetch_mode in ('load', 'load_cached'):
-            self._start_history_probe()
 
     def _on_error(self, message: str) -> None:
         self.status_label.setText(f'Error: {message}')
@@ -1293,6 +1859,136 @@ class ChartView(QWidget):
             self._history_probe_inflight.discard((worker.symbol, worker.timeframe))
         self._start_next_history_probe()
 
+    def _start_candle_normalize(self, bars: list, auto_range: bool) -> None:
+        if self._candle_normalize_worker and self._candle_normalize_worker.isRunning():
+            self._pending_normalize = (bars, auto_range)
+            return
+        if bars:
+            try:
+                existing = getattr(self.candles, "candles", [])
+            except Exception:
+                existing = []
+            if existing:
+                try:
+                    bars_start = float(bars[0][0])
+                    bars_end = float(bars[-1][0])
+                    existing_start = float(existing[0][0])
+                    existing_end = float(existing[-1][0])
+                except Exception:
+                    bars_start = bars_end = existing_start = existing_end = None
+                if bars_start is not None:
+                    ts_cache = getattr(self.candles, "_ts_cache", [])
+                    if ts_cache and bars_start >= existing_start and bars_end <= existing_end:
+                        try:
+                            start_idx = bisect_left(ts_cache, bars_start)
+                            end_idx = bisect_right(ts_cache, bars_end)
+                            normalized = existing[start_idx:end_idx]
+                        except Exception:
+                            normalized = None
+                        if normalized:
+                            self._ignore_view_range = True
+                            self._candle_normalize_seq += 1
+                            seq = self._candle_normalize_seq
+                            self._candle_normalize_last_ms = 0
+                            self._on_candle_normalized(seq, normalized, [], int(auto_range))
+                            return
+                    if bars_start <= existing_start and bars_end >= existing_end:
+                        prefix = []
+                        suffix = []
+                        try:
+                            for row in bars:
+                                ts = float(row[0])
+                                if ts < existing_start:
+                                    prefix.append(row)
+                                elif ts > existing_end:
+                                    suffix.append(row)
+                        except Exception:
+                            prefix = []
+                            suffix = []
+                        if prefix or suffix:
+                            self._ignore_view_range = True
+                            self._candle_normalize_seq += 1
+                            seq = self._candle_normalize_seq
+                            self._candle_normalize_last_start = time.time()
+                            self._candle_normalize_merge[seq] = {
+                                "prefix_len": len(prefix),
+                                "suffix_len": len(suffix),
+                                "existing": existing,
+                                "auto_range": bool(auto_range),
+                            }
+                            worker = CandleNormalizeWorker(prefix + suffix, auto_range, seq)
+                            self._candle_normalize_worker = worker
+                            worker.result.connect(self._on_candle_normalized)
+                            worker.error.connect(self._on_candle_normalize_error)
+                            worker.finished.connect(self._on_candle_normalize_finished)
+                            worker.start()
+                            self._ignore_view_range = True
+                            return
+        self._ignore_view_range = True
+        self._candle_normalize_seq += 1
+        seq = self._candle_normalize_seq
+        self._candle_normalize_last_start = time.time()
+        worker = CandleNormalizeWorker(bars, auto_range, seq)
+        self._candle_normalize_worker = worker
+        worker.result.connect(self._on_candle_normalized)
+        worker.error.connect(self._on_candle_normalize_error)
+        worker.finished.connect(self._on_candle_normalize_finished)
+        worker.start()
+
+    def _on_candle_normalized(self, seq: int, normalized: list, ts_cache: list, auto_range_flag: int) -> None:
+        if seq != self._candle_normalize_seq:
+            return
+        if hasattr(self, "_candle_normalize_last_start"):
+            self._candle_normalize_last_ms = int((time.time() - self._candle_normalize_last_start) * 1000)
+        try:
+            auto_range = bool(auto_range_flag)
+            merge_info = self._candle_normalize_merge.pop(seq, None)
+            if merge_info:
+                prefix_len = int(merge_info.get("prefix_len", 0))
+                suffix_len = int(merge_info.get("suffix_len", 0))
+                existing = merge_info.get("existing") or []
+                prefix = normalized[:prefix_len] if prefix_len > 0 else []
+                suffix = normalized[prefix_len:prefix_len + suffix_len] if suffix_len > 0 else []
+                normalized = prefix + existing + suffix
+            self.candles.begin_bulk_update()
+            self.candles.set_historical_data(normalized, auto_range=False, normalized=True)
+            self.candles.end_bulk_update(auto_range=auto_range)
+            try:
+                self._window_start_ms = int(normalized[0][0]) if normalized else None
+                self._window_end_ms = int(normalized[-1][0]) if normalized else None
+            except Exception:
+                pass
+            if self._last_fetch_mode in ('backfill', 'window') and self._pending_backfill_view:
+                try:
+                    view_box = self.plot_widget.getViewBox()
+                    view_box.setXRange(self._pending_backfill_view[0], self._pending_backfill_view[1], padding=0)
+                except Exception:
+                    pass
+                self._pending_backfill_view = None
+            if self._initial_load_pending:
+                self._apply_pending_live_updates()
+                self._initial_load_pending = False
+        except Exception as exc:
+            self._report_error(f'Chart render failed: {exc}')
+        finally:
+            self._ignore_view_range = False
+        self._recompute_indicators(immediate=True, reason="view")
+        self._refresh_history_end_status()
+        self._emit_debug_state()
+        self._start_live_stream()
+        if self._last_fetch_mode in ('load', 'load_cached'):
+            self._start_history_probe()
+
+    def _on_candle_normalize_error(self, message: str) -> None:
+        self._ignore_view_range = False
+        self._report_error(f'Chart render failed: {message}')
+
+    def _on_candle_normalize_finished(self) -> None:
+        if self._pending_normalize:
+            bars, auto_range = self._pending_normalize
+            self._pending_normalize = None
+            self._start_candle_normalize(bars, auto_range)
+
     def _start_live_stream(self) -> None:
         symbol = self.symbol_box.currentText() or 'BTCUSDT'
         timeframe = self.current_timeframe
@@ -1367,7 +2063,7 @@ class ChartView(QWidget):
                     self.store.store_bars(self.exchange, symbol, timeframe, [[ts, o, h, l, c, v]])
             except Exception as exc:
                 self._report_error(f'Cache update failed: {exc}')
-            self._recompute_indicators()
+            self._recompute_indicators(immediate=True, reason="close")
         self._emit_debug_state()
 
     def _on_trade(self, trade: dict) -> None:
@@ -1378,6 +2074,10 @@ class ChartView(QWidget):
             self.candles.update_live_trade(trade)
         except Exception as exc:
             self._report_error(f'Live trade update failed: {exc}')
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_live_indicator_ms >= 250:
+            self._last_live_indicator_ms = now_ms
+            self._recompute_indicators(immediate=False, reason="live")
         self._emit_debug_state()
 
     def _apply_pending_live_updates(self) -> None:
@@ -1406,7 +2106,7 @@ class ChartView(QWidget):
                 self.candles.update_live_trade(trade)
             except Exception as exc:
                 self._report_error(f'Live trade update failed: {exc}')
-        self._recompute_indicators()
+        self._recompute_indicators(immediate=True, reason="live")
 
     def _set_timeframe(self, timeframe: str) -> None:
         if timeframe == self.current_timeframe:
@@ -1447,6 +2147,14 @@ class ChartView(QWidget):
         tf_ms = self.candles.timeframe_ms or 60_000
         span = x_max - x_min
         span_bars = span / tf_ms if tf_ms > 0 else span
+        self._last_visible_bars = int(span_bars) if span_bars is not None else 0
+        try:
+            if span_bars and span_bars >= self._indicator_freeze_visible_bars:
+                self.candles.set_volume_live_updates_enabled(False)
+            else:
+                self.candles.set_volume_live_updates_enabled(True)
+        except Exception:
+            pass
         if span_bars > self._max_visible_bars:
             center = (x_min + x_max) / 2.0
             clamp_span = self._max_visible_bars * tf_ms
@@ -1459,8 +2167,29 @@ class ChartView(QWidget):
                 self._clamp_in_progress = False
             return
         self._pending_backfill_view = (x_min, x_max)
-        self._backfill_debounce_timer.start(250)
+        self._view_idle_timer.start(self._apply_idle_delay_ms)
+        if span_bars and span_bars >= self._indicator_freeze_visible_bars:
+            self._indicator_idle_timer.start(self._indicator_idle_ms)
+        debounce_ms = self._backfill_debounce_ms_zoomed_out if span_bars and span_bars >= self._indicator_freeze_visible_bars else self._backfill_debounce_ms_normal
+        self._backfill_debounce_timer.start(debounce_ms)
         self._emit_debug_state()
+        self._recompute_indicators(immediate=False, reason="view")
+
+    def _on_indicator_idle(self) -> None:
+        self._do_recompute_indicators(force=True)
+
+    def _on_view_idle(self) -> None:
+        if self._pending_apply_bars is None:
+            return
+        bars = self._pending_apply_bars
+        auto_range = self._pending_apply_auto_range
+        self._pending_apply_bars = None
+        self._pending_apply_auto_range = False
+        try:
+            self._start_candle_normalize(bars, auto_range)
+        except Exception as exc:
+            self._ignore_view_range = False
+            self._report_error(f'Chart render failed: {exc}')
 
     def _evaluate_backfill(self) -> None:
         if self._backfill_pending or (self._worker and self._worker.isRunning()):
@@ -1484,18 +2213,29 @@ class ChartView(QWidget):
         symbol = self.symbol_box.currentText() or 'BTCUSDT'
         timeframe = self.current_timeframe
         oldest_ts, oldest_reached = self.store.get_history_limit(self.exchange, symbol, timeframe)
-        left_at_end = bool(oldest_reached and oldest_ts is not None and current_min_ts <= oldest_ts)
         now_ms = int(time.time() * 1000)
-        right_at_end = (now_ms - current_max_ts) <= edge_threshold
-        left_near = (x_min - current_min_ts) <= edge_threshold
-        right_near = (x_max >= current_max_ts - edge_threshold)
-        left_beyond = (x_min <= current_min_ts - edge_threshold)
-        right_beyond = (x_max >= current_max_ts + edge_threshold)
-        if (left_near or left_beyond) and not left_at_end:
-            self._backfill_pending = True
-            self._backfill_timer.start(200)
+        if self._backfill_decision_worker and self._backfill_decision_worker.isRunning():
             return
-        if (right_near or right_beyond) and not right_at_end:
+        self._backfill_decision_last_start = time.time()
+        self._backfill_decision_worker = BackfillDecisionWorker(
+            x_min,
+            x_max,
+            int(tf_ms),
+            int(current_min_ts),
+            int(current_max_ts),
+            int(oldest_ts) if oldest_ts is not None else None,
+            bool(oldest_reached),
+            int(now_ms),
+        )
+        self._backfill_decision_worker.result.connect(self._on_backfill_decision)
+        self._backfill_decision_worker.error.connect(lambda msg: None)
+        self._backfill_decision_worker.start()
+
+    def _on_backfill_decision(self, result: dict) -> None:
+        if hasattr(self, "_backfill_decision_last_start"):
+            self._backfill_decision_last_ms = int((time.time() - self._backfill_decision_last_start) * 1000)
+        action = result.get("action")
+        if action in ("left", "right"):
             self._backfill_pending = True
             self._backfill_timer.start(200)
 
@@ -1628,6 +2368,10 @@ class ChartView(QWidget):
         lines.append(f'Fetch mode: {self._last_fetch_mode}')
         if self._last_fetch_duration_ms is not None:
             lines.append(f'Last fetch: {self._last_fetch_duration_ms} ms')
+        lines.append(f'Indicator compute: {self._indicator_compute_last_ms} ms')
+        lines.append(f'Candle normalize: {self._candle_normalize_last_ms} ms')
+        lines.append(f'Backfill decision: {self._backfill_decision_last_ms} ms')
+        lines.append(f'Volume prep: {self.candles.get_volume_worker_ms()} ms')
         lines.append(f'Worker running: {bool(self._worker and self._worker.isRunning())}')
         lines.append(f'Window pending: {self._backfill_pending}')
         lines.append(f'Live kline: {bool(self._kline_worker and self._kline_worker.isRunning())}')

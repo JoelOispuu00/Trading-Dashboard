@@ -54,28 +54,28 @@ class IndicatorContext:
 
     def series(self, bars: Iterable, field: str) -> np.ndarray:
         if field == "open":
-            return self._bundle.open.copy()
+            return self._bundle.open
         if field == "high":
-            return self._bundle.high.copy()
+            return self._bundle.high
         if field == "low":
-            return self._bundle.low.copy()
+            return self._bundle.low
         if field == "close":
-            return self._bundle.close.copy()
+            return self._bundle.close
         if field == "volume":
-            return self._bundle.volume.copy()
-        return self._bundle.close.copy()
+            return self._bundle.volume
+        return self._bundle.close
 
     def time(self, bars: Iterable) -> np.ndarray:
-        return self._bundle.time.astype(np.int64, copy=True)
+        return self._bundle.time
 
     def ohlc(self, bars: Iterable) -> Dict[str, np.ndarray]:
         return {
-            "time": self._bundle.time.copy(),
-            "open": self._bundle.open.copy(),
-            "high": self._bundle.high.copy(),
-            "low": self._bundle.low.copy(),
-            "close": self._bundle.close.copy(),
-            "volume": self._bundle.volume.copy(),
+            "time": self._bundle.time,
+            "open": self._bundle.open,
+            "high": self._bundle.high,
+            "low": self._bundle.low,
+            "close": self._bundle.close,
+            "volume": self._bundle.volume,
         }
 
     def hl2(self, bars: Iterable) -> np.ndarray:
@@ -208,7 +208,15 @@ def run_compute(
     params: Dict[str, Any],
     compute_fn,
 ) -> Tuple[Dict[str, Any], int]:
-    normalized = normalize_bars(bars)
+    normalized: List[Iterable[float]]
+    if isinstance(bars, list) and bars:
+        first = bars[0]
+        if isinstance(first, (list, tuple)) and len(first) >= 5:
+            normalized = bars
+        else:
+            normalized = normalize_bars(bars)
+    else:
+        normalized = normalize_bars(bars)
     bars_np = helpers.bars_to_numpy(normalized)
     ctx = IndicatorContext(bars_np)
     result = compute_fn(normalized, params, ctx)
