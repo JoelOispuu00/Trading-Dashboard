@@ -10,7 +10,7 @@ local so it’s fast, private, and scalable.
 - High-performance charting with windowed loading and LOD
 - SQLite cache + live market streams
 - Indicator system under development
-- Strategy runtime + backtesting architecture planned
+- Strategy runtime + backtesting under development
 - Deep backtester architecture planned
 - Clean, modern dark-theme UI
 
@@ -28,7 +28,7 @@ local so it’s fast, private, and scalable.
 - Charting + windowed loading + cache (done)
 - Polished UI/UX (done)
 - Indicator system (hot-reload + renderer) (in progress)
-- - Strategy runtime + backtesting (in progress)
+- Strategy runtime + backtesting (in progress)
 - Strategy overlays (entries/exits, stops/targets) (in progress)
 - Renko
 - Integrate more exchanges (spot + futures pairs)
