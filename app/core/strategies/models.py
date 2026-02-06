@@ -35,6 +35,8 @@ class Position:
     size: float = 0.0
     entry_price: Optional[float] = None
     entry_ts: Optional[int] = None
+    # Entry commission accrued when opening the position. Exit commission is computed on close.
+    entry_fee_total: float = 0.0
 
 
 @dataclass

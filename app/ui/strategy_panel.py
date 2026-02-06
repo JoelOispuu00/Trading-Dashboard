@@ -53,6 +53,7 @@ class StrategyPanel(QDockWidget):
         layout.addWidget(QLabel("Run Config"))
         self.use_visible_range = QCheckBox("Use visible range")
         self.use_visible_range.setChecked(True)
+        self.use_visible_range.toggled.connect(self._sync_range_controls)
         layout.addWidget(self.use_visible_range)
 
         self.start_picker = QDateTimeEdit()
@@ -64,6 +65,7 @@ class StrategyPanel(QDockWidget):
         now = QDateTime.currentDateTime()
         self.start_picker.setDateTime(now.addDays(-7))
         self.end_picker.setDateTime(now)
+        self._sync_range_controls(self.use_visible_range.isChecked())
 
         self.warmup_spin = QSpinBox()
         self.warmup_spin.setRange(0, 10000)
@@ -111,6 +113,11 @@ class StrategyPanel(QDockWidget):
 
         self.setWidget(container)
         self.params_container.setVisible(False)
+
+    def _sync_range_controls(self, use_visible: bool) -> None:
+        # If using the visible window, the date pickers are ignored.
+        self.start_picker.setEnabled(not use_visible)
+        self.end_picker.setEnabled(not use_visible)
 
     def set_strategies(self, strategies: List[dict]) -> None:
         self._strategies = {s["strategy_id"]: s for s in strategies}

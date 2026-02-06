@@ -34,20 +34,20 @@ def run_backtest(
 
     if on_init:
         on_init(ctx)
-    # Debug: capture EMA values for EMA Cross if no trades
-    try:
-        if getattr(strategy_module, "__name__", "") and hasattr(strategy_module, "schema"):
-            if strategy_module.schema().get("id") == "ema_cross":
-                fast_len = int(params.get("fast", 12))
-                slow_len = int(params.get("slow", 26))
-                ctx._debug_fast = ctx.ind.ema(ctx.close, fast_len)
-                ctx._debug_slow = ctx.ind.ema(ctx.close, slow_len)
-    except Exception:
-        pass
 
     n = len(bars)
     cancel_every = 100
     status = "DONE"
+
+    ts_arr = bars[:, 0].astype(np.int64, copy=False)
+
+    def _last_idx_at_or_before(ts_limit: int) -> int:
+        # Rightmost index where ts_arr[idx] <= ts_limit, or -1 if none.
+        try:
+            idx = int(np.searchsorted(ts_arr, int(ts_limit), side="right") - 1)
+        except Exception:
+            idx = -1
+        return idx
 
     pending_orders: list[dict] = []
     for i in range(0, n - 1):
@@ -59,28 +59,32 @@ def run_backtest(
 
         ctx.set_bar_index(i)
         ts = int(bars[i][0])
-        close_price = float(bars[i][4])
-        mark_to_market(ctx.portfolio, ctx.position, close_price)
-
-        if ts >= config.start_ts:
-            result.equity_ts.append(ts)
-            result.equity.append(ctx.portfolio.equity)
-            result.drawdown.append(ctx.portfolio.drawdown)
-            result.position_size.append(ctx.position.size)
-            result.price.append(close_price)
-
+        if ts > int(config.end_ts):
+            # Hard boundary: never process/record beyond end_ts.
+            break
+        # Execute pending orders at the open of this bar (orders were submitted on bar i-1).
         if pending_orders:
             open_price = float(bars[i][1])
             for o in pending_orders:
-                side = o.get("side")
+                side = str(o.get("side", "")).upper()
                 size = float(o.get("size", 0.0))
                 if side == "FLATTEN":
+                    # Flatten on flat is a clean no-op (no order event).
                     if ctx.position.size == 0:
                         continue
                     side = "SELL" if ctx.position.size > 0 else "BUY"
-                    size = abs(ctx.position.size)
+                    size = float(abs(ctx.position.size))
 
                 order = Order(submitted_ts=int(o.get("submitted_ts", ts)), side=side, size=size)
+
+                if not np.isfinite(size) or size <= 0.0:
+                    order.status = "REJECTED"
+                    order.reason = "invalid_size"
+                    result.orders.append(order)
+                    if on_order:
+                        on_order(ctx, order)
+                    continue
+
                 fill_price = compute_fill_price(open_price, side, config.slippage_bps)
                 ok, _ = can_fill(size, fill_price, ctx.portfolio.equity, config.leverage)
                 if not ok:
@@ -90,6 +94,7 @@ def run_backtest(
                     if on_order:
                         on_order(ctx, order)
                     continue
+
                 fee = compute_fee(size, fill_price, config.commission_bps)
                 order.fill_ts = ts
                 order.fill_price = fill_price
@@ -98,21 +103,32 @@ def run_backtest(
                 result.orders.append(order)
 
                 if ctx.position.size == 0:
+                    # Open new position: entry fee is recorded on the position and subtracted from cash once.
                     ctx.position.size = size if side == "BUY" else -size
                     ctx.position.entry_price = fill_price
                     ctx.position.entry_ts = ts
+                    ctx.position.entry_fee_total = float(fee)
                     ctx.portfolio.cash -= fee
+                    # Keep equity consistent for subsequent fills on the same open.
+                    mark_to_market(ctx.portfolio, ctx.position, fill_price)
                 else:
+                    # Close position (or reject scaling-in/out in V2).
                     if (ctx.position.size > 0 and side == "BUY") or (ctx.position.size < 0 and side == "SELL"):
                         if not last_warn.get("scale", False):
                             ctx.logger.warn("scaling not supported in V2", ts, ts)
                             last_warn["scale"] = True
                         continue
+
                     entry_price = float(ctx.position.entry_price or fill_price)
                     entry_ts = int(ctx.position.entry_ts or ts)
-                    pnl = (fill_price - entry_price) * ctx.position.size
-                    ctx.portfolio.cash += pnl
+                    entry_fee_total = float(getattr(ctx.position, "entry_fee_total", 0.0))
+                    gross_pnl = (fill_price - entry_price) * ctx.position.size
+
+                    # Cash already reflects entry fees; on exit apply gross pnl and exit fee.
+                    ctx.portfolio.cash += gross_pnl
                     ctx.portfolio.cash -= fee
+
+                    fee_total = entry_fee_total + fee
                     trade = Trade(
                         side=position_side(ctx.position) or "LONG",
                         size=abs(ctx.position.size),
@@ -120,16 +136,29 @@ def run_backtest(
                         entry_price=entry_price,
                         exit_ts=ts,
                         exit_price=fill_price,
-                        pnl=pnl - fee,
-                        fee_total=fee,
+                        pnl=gross_pnl - fee_total,
+                        fee_total=fee_total,
                         bars_held=max(1, int((ts - entry_ts) / max(1, (bars[1][0] - bars[0][0])))),
                     )
                     result.trades.append(trade)
                     if on_trade:
                         on_trade(ctx, trade)
                     close_position(ctx.position)
+                    ctx.position.entry_fee_total = 0.0
+                    mark_to_market(ctx.portfolio, ctx.position, fill_price)
+
                 if on_order:
                     on_order(ctx, order)
+
+        close_price = float(bars[i][4])
+        mark_to_market(ctx.portfolio, ctx.position, close_price)
+
+        if ts >= config.start_ts and ts <= int(config.end_ts):
+            result.equity_ts.append(ts)
+            result.equity.append(ctx.portfolio.equity)
+            result.drawdown.append(ctx.portfolio.drawdown)
+            result.position_size.append(ctx.position.size)
+            result.price.append(close_price)
 
         if ts < config.start_ts:
             ctx.trading_enabled = False
@@ -143,67 +172,72 @@ def run_backtest(
         pending_orders = ctx.pop_orders()
 
     if status == "CANCELED":
-        i = min(i, n - 1)
-        if ctx.position.size != 0:
-            close_price = float(bars[i][4])
-            fee = compute_fee(abs(ctx.position.size), close_price, config.commission_bps)
-            pnl = (close_price - float(ctx.position.entry_price or close_price)) * ctx.position.size
-            ctx.portfolio.cash += pnl - fee
+        # Forced close at the last bar at-or-before end_ts (or current bar if earlier).
+        close_idx = _last_idx_at_or_before(min(int(config.end_ts), int(ts_arr[min(i, n - 1)])))
+        if close_idx < 0:
+            close_idx = min(i, n - 1)
+        if ctx.position.size != 0 and close_idx >= 0:
+            close_price = float(bars[close_idx][4])
+            close_side = "SELL" if ctx.position.size > 0 else "BUY"
+            fill_price = compute_fill_price(close_price, close_side, config.slippage_bps)
+            fee = compute_fee(abs(ctx.position.size), fill_price, config.commission_bps)
+            entry_price = float(ctx.position.entry_price or fill_price)
+            entry_fee_total = float(getattr(ctx.position, "entry_fee_total", 0.0))
+            gross_pnl = (fill_price - entry_price) * ctx.position.size
+            ctx.portfolio.cash += gross_pnl - fee
+            fee_total = entry_fee_total + fee
             trade = Trade(
                 side=position_side(ctx.position) or "LONG",
                 size=abs(ctx.position.size),
-                entry_ts=int(ctx.position.entry_ts or bars[i][0]),
-                entry_price=float(ctx.position.entry_price or close_price),
-                exit_ts=int(bars[i][0]),
-                exit_price=close_price,
-                pnl=pnl - fee,
-                fee_total=fee,
+                entry_ts=int(ctx.position.entry_ts or bars[close_idx][0]),
+                entry_price=entry_price,
+                exit_ts=int(bars[close_idx][0]),
+                exit_price=fill_price,
+                pnl=gross_pnl - fee_total,
+                fee_total=fee_total,
                 bars_held=1,
             )
             result.trades.append(trade)
             close_position(ctx.position)
+            ctx.position.entry_fee_total = 0.0
     else:
         if config.close_on_finish and ctx.position.size != 0:
-            close_price = float(bars[-1][4])
-            fee = compute_fee(abs(ctx.position.size), close_price, config.commission_bps)
-            pnl = (close_price - float(ctx.position.entry_price or close_price)) * ctx.position.size
-            ctx.portfolio.cash += pnl - fee
+            close_idx = _last_idx_at_or_before(int(config.end_ts))
+            if close_idx < 0:
+                # No bar at-or-before end_ts; nothing deterministic to do.
+                close_idx = -1
+            if close_idx < 0:
+                pending_orders = []
+                result.logs.extend(ctx.get_logs())
+                if on_finish:
+                    on_finish(ctx)
+                return result, status
+            close_price = float(bars[close_idx][4])
+            close_side = "SELL" if ctx.position.size > 0 else "BUY"
+            fill_price = compute_fill_price(close_price, close_side, config.slippage_bps)
+            fee = compute_fee(abs(ctx.position.size), fill_price, config.commission_bps)
+            entry_price = float(ctx.position.entry_price or fill_price)
+            entry_fee_total = float(getattr(ctx.position, "entry_fee_total", 0.0))
+            gross_pnl = (fill_price - entry_price) * ctx.position.size
+            ctx.portfolio.cash += gross_pnl - fee
+            fee_total = entry_fee_total + fee
             trade = Trade(
                 side=position_side(ctx.position) or "LONG",
                 size=abs(ctx.position.size),
-                entry_ts=int(ctx.position.entry_ts or bars[-1][0]),
-                entry_price=float(ctx.position.entry_price or close_price),
-                exit_ts=int(bars[-1][0]),
-                exit_price=close_price,
-                pnl=pnl - fee,
-                fee_total=fee,
+                entry_ts=int(ctx.position.entry_ts or bars[close_idx][0]),
+                entry_price=entry_price,
+                exit_ts=int(bars[close_idx][0]),
+                exit_price=fill_price,
+                pnl=gross_pnl - fee_total,
+                fee_total=fee_total,
                 bars_held=1,
             )
             result.trades.append(trade)
             close_position(ctx.position)
+            ctx.position.entry_fee_total = 0.0
 
     pending_orders = []
     result.logs.extend(ctx.get_logs())
-    try:
-        if hasattr(ctx, "_debug_fast"):
-            result._debug_fast = ctx._debug_fast
-        if hasattr(ctx, "_debug_slow"):
-            result._debug_slow = ctx._debug_slow
-        if hasattr(ctx, "_debug_fast") and hasattr(ctx, "_debug_slow"):
-            fast = ctx._debug_fast
-            slow = ctx._debug_slow
-            cross_up = 0
-            cross_dn = 0
-            for j in range(1, len(fast)):
-                if np.isnan(fast[j - 1]) or np.isnan(slow[j - 1]) or np.isnan(fast[j]) or np.isnan(slow[j]):
-                    continue
-                if fast[j] > slow[j] and fast[j - 1] <= slow[j - 1]:
-                    cross_up += 1
-                if fast[j] < slow[j] and fast[j - 1] >= slow[j - 1]:
-                    cross_dn += 1
-            result._debug_cross = (cross_up, cross_dn)
-    except Exception:
-        pass
     if on_finish:
         on_finish(ctx)
     return result, status

@@ -122,6 +122,8 @@ class StrategyContext:
         self.logger = StrategyLogger(self._logs, emit=log_emit)
         self.size = SizeHelper(self)
         self.trading_enabled = True
+        # Warmup/no-trading warn-once per method (buy/sell/flatten) for this run.
+        self._disabled_warned: set[str] = set()
         self._current_index: Optional[int] = None
         self._current_close: Optional[float] = None
 
@@ -139,6 +141,12 @@ class StrategyContext:
         self._enqueue_order("SELL", size)
 
     def flatten(self) -> None:
+        # Flatten on flat position is a clean no-op in V2, but warmup/no-trading still warns once.
+        if not self.trading_enabled:
+            self._enqueue_order("FLATTEN", 0.0)
+            return
+        if self.position.size == 0:
+            return
         self._enqueue_order("FLATTEN", 0.0)
 
     def cancel(self, _order_id: str) -> None:
@@ -152,7 +160,12 @@ class StrategyContext:
             return
         ts = int(self.time[self._current_index])
         if not self.trading_enabled:
-            self.logger.warn(f"trading disabled, {side.lower()} ignored", ts, ts)
+            key = side.upper()
+            if key not in self._disabled_warned:
+                # Warn once per run per method, otherwise strategies can spam logs during warmup.
+                self._disabled_warned.add(key)
+                msg = "trading disabled, flatten ignored" if key == "FLATTEN" else f"trading disabled, {key.lower()} ignored"
+                self.logger.warn(msg, ts, ts)
             return
         self._pending_orders.append({"side": side, "size": float(size), "submitted_ts": ts})
 

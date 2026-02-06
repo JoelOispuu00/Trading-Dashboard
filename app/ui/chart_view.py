@@ -1173,22 +1173,28 @@ class ChartView(QWidget):
             self._report_error(f'Strategy schema invalid: {err}')
             return
         resolved = resolve_params(schema_dict, params)
-        if run_cfg.get("use_visible_range"):
+        use_visible_range = bool(run_cfg.get("use_visible_range"))
+        if use_visible_range:
             ts_min, ts_max = self.get_visible_ts_range_snapshot()
             start_ts = ts_min
             end_ts = ts_max
         else:
             start_ts = int(run_cfg.get("start_ts"))
             end_ts = int(run_cfg.get("end_ts"))
-        try:
-            range_min, range_max = self.candles.get_time_range()
-            if range_min is not None and range_max is not None:
-                if start_ts < range_min:
-                    start_ts = range_min
-                if end_ts > range_max:
-                    end_ts = range_max
-        except Exception:
-            pass
+
+        # Important: do not clamp date-based backtests to the currently-loaded chart window.
+        # In windowed mode the chart only has a slice of history; the backtest range loader is responsible
+        # for validating/fetching coverage from the OHLCV cache/provider.
+        if use_visible_range:
+            try:
+                range_min, range_max = self.candles.get_time_range()
+                if range_min is not None and range_max is not None:
+                    if start_ts < range_min:
+                        start_ts = range_min
+                    if end_ts > range_max:
+                        end_ts = range_max
+            except Exception:
+                pass
         if start_ts >= end_ts:
             self._report_error("Invalid backtest range")
             return
@@ -1241,15 +1247,6 @@ class ChartView(QWidget):
             self._report_error(
                 f"Backtest done ({status}). Bars={len(bars_np)} range={bar_min}..{bar_max} equity_pts={len(report.equity_ts)} trades={len(report.trades)}."
             )
-            if len(report.trades) == 0:
-                fast = getattr(result, "_debug_fast", None)
-                slow = getattr(result, "_debug_slow", None)
-                fast_val = float(fast[-1]) if fast is not None and len(fast) else "n/a"
-                slow_val = float(slow[-1]) if slow is not None and len(slow) else "n/a"
-                self._report_error(f"EMA fast/slow sample: {fast_val} / {slow_val}")
-                cross = getattr(result, "_debug_cross", None)
-                if cross is not None:
-                    self._report_error(f"EMA crosses: up={cross[0]} down={cross[1]}")
         except Exception:
             self._report_error(
                 f"Backtest done ({status}). equity_pts={len(report.equity_ts)} trades={len(report.trades)}."
@@ -1271,7 +1268,7 @@ class ChartView(QWidget):
             store = None
         if store is not None:
             try:
-                store.create_run({
+                run_payload = {
                     "run_id": run_id,
                     "created_at": int(time.time() * 1000),
                     "strategy_id": info.strategy_id,
@@ -1289,7 +1286,7 @@ class ChartView(QWidget):
                     "status": status,
                     "params_json": json.dumps(params),
                     "error_text": None,
-                })
+                }
                 orders_payload = [
                     {
                         "submitted_ts": order.submitted_ts,
@@ -1329,10 +1326,14 @@ class ChartView(QWidget):
                 ]
                 messages_payload = list(getattr(result, "logs", []))
 
-                store.insert_orders(run_id, orders_payload)
-                store.insert_trades(run_id, trades_payload)
-                store.insert_equity_points(run_id, equity_payload)
-                store.insert_messages(run_id, messages_payload)
+                # Atomic persistence: run row + bundle in a single transaction to avoid partial runs.
+                store.insert_complete_run(
+                    run=run_payload,
+                    orders=orders_payload,
+                    trades=trades_payload,
+                    equity_points=equity_payload,
+                    messages=messages_payload,
+                )
             except Exception:
                 pass
         report.run_id = run_id
@@ -2391,6 +2392,11 @@ class ChartView(QWidget):
             self._trade_worker.stop()
             self._trade_worker.wait(1500)
             self._trade_worker = None
+        if getattr(self, "_strategy_store", None) is not None:
+            try:
+                self._strategy_store.close()
+            except Exception:
+                pass
 
     def export_chart_png(self, path: str) -> None:
         pixmap = self.plot_widget.grab()
@@ -2538,10 +2544,6 @@ class ChartView(QWidget):
                 self._clamp_in_progress = False
             return
         self._pending_backfill_view = (x_min, x_max)
-        try:
-            self.visible_ts_range_changed.emit(int(x_min), int(x_max))
-        except Exception:
-            pass
         self._view_idle_timer.start(self._apply_idle_delay_ms)
         if span_bars and span_bars >= self._indicator_freeze_visible_bars:
             self._indicator_idle_timer.start(self._indicator_idle_ms)

@@ -233,6 +233,10 @@ def load_range_bars(
     if start_ms >= end_ms:
         return []
     interval_ms = timeframe_to_ms(timeframe)
+    now_ms = int(time.time() * 1000)
+    if end_ms > now_ms + (interval_ms * 2):
+        # End is meaningfully in the future; treat as user/config error for deterministic backtests.
+        raise ValueError(f"Backtest end_ts is in the future: {end_ms} > {now_ms}")
 
     def _missing_ranges(rows: List[List[float]]) -> List[Tuple[int, int]]:
         if not rows:
@@ -248,26 +252,27 @@ def load_range_bars(
             prev_ts = ts
         if int(rows[-1][0]) < end_ms - int(interval_ms * 0.5):
             missing.append((int(rows[-1][0]) + interval_ms, end_ms))
-        return [(s, e) for s, e in missing if s < e]
+        # Keep single-bar gaps (s == e) so the loader can fetch/validate them deterministically.
+        return [(s, e) for s, e in missing if s <= e]
 
     cached = store.load_bars(exchange, symbol, timeframe, start_ms, end_ms)
     cached_list = [list(row) for row in cached]
     missing = _missing_ranges(cached_list)
     if missing and allow_fetch:
-        for miss_start, miss_end in missing:
-            bars = binance.fetch_ohlcv(symbol, timeframe, miss_start, miss_end)
-            if bars:
-                store.store_bars(exchange, symbol, timeframe, bars)
-        cached = store.load_bars(exchange, symbol, timeframe, start_ms, end_ms)
-        cached_list = [list(row) for row in cached]
-        missing = _missing_ranges(cached_list)
+        # Iterate: fetching a range can still leave gaps (rate limits, provider limits).
+        for _ in range(3):
+            if not missing:
+                break
+            for miss_start, miss_end in missing:
+                if miss_start > miss_end:
+                    continue
+                bars = binance.fetch_ohlcv(symbol, timeframe, miss_start, miss_end)
+                if bars:
+                    store.store_bars(exchange, symbol, timeframe, bars)
+            cached = store.load_bars(exchange, symbol, timeframe, start_ms, end_ms)
+            cached_list = [list(row) for row in cached]
+            missing = _missing_ranges(cached_list)
     if missing:
-        # If missing data is only at the very end (beyond latest available bar), allow it.
-        if cached_list:
-            last_ts = int(cached_list[-1][0])
-            trailing_only = all(m[0] >= last_ts for m in missing)
-            if trailing_only:
-                return cached_list
         raise ValueError(f"Missing OHLCV data for range {start_ms}-{end_ms}: {missing}")
     return cached_list
 

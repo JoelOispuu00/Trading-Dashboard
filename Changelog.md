@@ -153,4 +153,20 @@
 - Built the backtest engine + broker + portfolio accounting (orders, trades, equity curve, drawdown).
 - Added strategy UI docks (Strategy panel with param forms + run config; Report dock with equity curve + trade list).
 - Persisted runs, orders, trades, equity, and logs to a dedicated strategy.sqlite store.
-- Added strategy report normalization (stats + markers) and chart overlays for entries/exits.
+
+## 0.8.1
+- Added strategy report normalization (stats + markers); overlay rendering is temporarily disabled while the RecursionError root cause is unresolved.
+- Fixed trade accounting so `Trade.pnl` and `Trade.fee_total` are net of both entry and exit fees (no double-counting in cash).
+- Forced-close behavior (end-of-run + cancel) now applies side-aware slippage and commissions to the close-based fill.
+- Warmup trading-disabled calls are now warn-once per run per method (buy/sell/flatten); `flatten()` on flat is a clean no-op.
+- Backtest range loading now guarantees full OHLCV coverage for the requested span (auto-fetch missing segments or hard-fail with missing ranges).
+- Hardened strategy.sqlite persistence: single-transaction run-bundle writes with batched equity inserts to avoid UI stalls on large runs.
+- Expanded `unittest` coverage for fill model, determinism, fee/slippage semantics, margin rejections, warmup behavior, and short PnL sign.
+- Removed temporary EMA-cross debug injection / debug spam from the backtest finish path.
+- Made strategy persistence fully atomic on completion (run row + orders/trades/equity/messages written in one transaction).
+- Added offline integration tests for `load_range_bars()` coverage (missing leading, internal gaps, missing trailing).
+- Strategy hot-reload now keeps the last valid strategy version visible if a file breaks on reload.
+- Backtest now enforces `end_ts` as a hard boundary; forced closes use the last bar at-or-before `end_ts`.
+- Added a minimal headless backtest runner (`core.strategies.cli`) for debugging without the GUI.
+- Headless CLI fetches missing OHLCV segments by default (use `--no-fetch` to hard-fail on gaps).
+- Strategy backtests now respect the date range pickers when "Use visible range" is unchecked (no clamping to the currently-loaded chart window).
