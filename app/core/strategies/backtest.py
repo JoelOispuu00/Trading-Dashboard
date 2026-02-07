@@ -36,7 +36,8 @@ def run_backtest(
         on_init(ctx)
 
     n = len(bars)
-    cancel_every = 100
+    # Cancellation should be responsive; checking once per bar is cheap compared to compute/render.
+    cancel_every = 1 if cancel_flag else 100
     status = "DONE"
 
     ts_arr = bars[:, 0].astype(np.int64, copy=False)

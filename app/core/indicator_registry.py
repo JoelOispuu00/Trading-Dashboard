@@ -16,6 +16,11 @@ class IndicatorInfo:
     path: str
     module_hash: str
     module: object
+    load_error: Optional[str] = None
+
+
+# Keep last-good indicator definition per file path so hot reload doesn't drop indicators on syntax errors.
+_LAST_GOOD_BY_PATH: Dict[str, IndicatorInfo] = {}
 
 
 def discover_indicators(root_paths: str | Iterable[str]) -> List[IndicatorInfo]:
@@ -31,46 +36,69 @@ def discover_indicators(root_paths: str | Iterable[str]) -> List[IndicatorInfo]:
             if entry.startswith("_"):
                 continue
             path = os.path.join(root_path, entry)
-            module = _load_module_from_path(path)
-            if module is None:
-                continue
-            schema = _safe_schema(module)
-            if not schema:
+            module, mod_err = _load_module_from_path(path)
+            schema = _safe_schema(module) if module is not None else None
+            if module is None or not schema:
+                last_good = _LAST_GOOD_BY_PATH.get(path)
+                if last_good is not None:
+                    indicators.append(
+                        IndicatorInfo(
+                            indicator_id=last_good.indicator_id,
+                            name=last_good.name,
+                            inputs=last_good.inputs,
+                            pane=last_good.pane,
+                            path=last_good.path,
+                            module_hash=last_good.module_hash,
+                            module=last_good.module,
+                            load_error=(mod_err or "schema/load failed"),
+                        )
+                    )
                 continue
             indicator_id = str(schema.get("id") or os.path.splitext(entry)[0])
             name = str(schema.get("name") or indicator_id)
             inputs = schema.get("inputs") or {}
             pane = str(schema.get("pane") or "price")
             module_hash = _hash_file(path)
-            indicators.append(
-                IndicatorInfo(
-                    indicator_id=indicator_id,
-                    name=name,
-                    inputs=inputs,
-                    pane=pane,
-                    path=path,
-                    module_hash=module_hash,
-                    module=module,
-                )
+            out = IndicatorInfo(
+                indicator_id=indicator_id,
+                name=name,
+                inputs=inputs,
+                pane=pane,
+                path=path,
+                module_hash=module_hash,
+                module=module,
+                load_error=None,
             )
+            _LAST_GOOD_BY_PATH[path] = out
+            indicators.append(out)
 
     indicators.sort(key=lambda info: info.name.lower())
     return indicators
 
 
 def reload_indicator(info: IndicatorInfo) -> Optional[IndicatorInfo]:
-    module = _load_module_from_path(info.path)
-    if module is None:
-        return None
-    schema = _safe_schema(module)
-    if not schema:
+    module, mod_err = _load_module_from_path(info.path)
+    schema = _safe_schema(module) if module is not None else None
+    if module is None or not schema:
+        last_good = _LAST_GOOD_BY_PATH.get(info.path)
+        if last_good is not None:
+            return IndicatorInfo(
+                indicator_id=last_good.indicator_id,
+                name=last_good.name,
+                inputs=last_good.inputs,
+                pane=last_good.pane,
+                path=last_good.path,
+                module_hash=last_good.module_hash,
+                module=last_good.module,
+                load_error=(mod_err or "schema/load failed"),
+            )
         return None
     indicator_id = str(schema.get("id") or info.indicator_id)
     name = str(schema.get("name") or info.name)
     inputs = schema.get("inputs") or {}
     pane = str(schema.get("pane") or info.pane)
     module_hash = _hash_file(info.path)
-    return IndicatorInfo(
+    out = IndicatorInfo(
         indicator_id=indicator_id,
         name=name,
         inputs=inputs,
@@ -78,19 +106,22 @@ def reload_indicator(info: IndicatorInfo) -> Optional[IndicatorInfo]:
         path=info.path,
         module_hash=module_hash,
         module=module,
+        load_error=None,
     )
+    _LAST_GOOD_BY_PATH[info.path] = out
+    return out
 
 
-def _load_module_from_path(path: str) -> Optional[object]:
+def _load_module_from_path(path: str) -> tuple[Optional[object], Optional[str]]:
     try:
         spec = importlib.util.spec_from_file_location(f"indicator_{os.path.basename(path)}", path)
         if spec is None or spec.loader is None:
-            return None
+            return None, "no spec/loader"
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module
-    except Exception:
-        return None
+        return module, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def _safe_schema(module: object) -> Optional[Dict[str, dict]]:

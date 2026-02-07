@@ -14,8 +14,8 @@ from PyQt6.QtCore import QThread, pyqtSignal, QSortFilterProxyModel, Qt, QTimer,
 from core.data_store import DataStore
 from core.data_fetch import load_recent_bars, load_symbols, load_more_history, load_cached_bars, load_cached_full, load_window_bars, load_range_bars, timeframe_to_ms, ensure_history_floor
 from core.indicator_registry import discover_indicators, IndicatorInfo
-from core.hot_reload import start_watcher, IndicatorHotReloadWorker, GenericHotReloadWorker
-from core.strategies.registry import discover_strategies, StrategyInfo, start_strategy_watcher
+from core.hot_reload import start_fs_watcher, QtFsHotReload
+from core.strategies.registry import discover_strategies, StrategyInfo
 from core.strategies.schema import validate_schema, resolve_params
 from core.strategies.backtest import run_backtest
 from core.strategies.report import build_report
@@ -218,6 +218,7 @@ class StrategyBacktestWorker(QThread):
     finished = pyqtSignal(str, object, object)
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int)
+    stage = pyqtSignal(str)
 
     def __init__(
         self,
@@ -238,6 +239,7 @@ class StrategyBacktestWorker(QThread):
 
     def run(self) -> None:
         try:
+            self.stage.emit("Loading bars...")
             bars = load_range_bars(
                 self._store,
                 self._exchange,
@@ -245,11 +247,12 @@ class StrategyBacktestWorker(QThread):
                 self._run_config.timeframe,
                 self._run_config.start_ts - (self._run_config.warmup_bars * timeframe_to_ms(self._run_config.timeframe)),
                 self._run_config.end_ts,
-                allow_fetch=True,
+                allow_fetch=bool(getattr(self._run_config, "allow_fetch", True)),
             )
             if not bars:
                 raise ValueError("No bars returned for strategy backtest")
             bars_np = np.asarray(bars, dtype=np.float64)
+            self.stage.emit("Running backtest...")
             result, status = run_backtest(
                 bars_np,
                 self._strategy_info.module,
@@ -258,6 +261,7 @@ class StrategyBacktestWorker(QThread):
                 cancel_flag=self._cancel_flag,
                 progress_cb=lambda i, n: self.progress.emit(i, n),
             )
+            self.stage.emit("Finishing...")
             self.finished.emit(status, result, bars_np)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -705,7 +709,7 @@ class ChartView(QWidget):
             "price": IndicatorRenderer(self.plot_widget.getPlotItem())
         }
         self._indicator_panes: Dict[str, pg.PlotWidget] = {"price": self.plot_widget}
-        self._indicator_hot_reload: Optional[IndicatorHotReloadWorker] = None
+        self._indicator_hot_reload: Optional[QtFsHotReload] = None
         self._indicator_recompute_pending = False
         self._indicator_recompute_timer = QTimer(self)
         self._indicator_recompute_timer.setSingleShot(True)
@@ -739,7 +743,7 @@ class ChartView(QWidget):
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "strategies", "custom")),
         ]
         self._strategy_defs: Dict[str, StrategyInfo] = {}
-        self._strategy_hot_reload: Optional[GenericHotReloadWorker] = None
+        self._strategy_hot_reload: Optional[QtFsHotReload] = None
         self._strategy_worker: Optional[StrategyBacktestWorker] = None
         self._strategy_cancel_requested = False
         self._strategy_store: Optional[StrategyStore] = None
@@ -751,12 +755,14 @@ class ChartView(QWidget):
         self._load_indicator_definitions()
         self._load_indicator_instances()
         self._wire_indicator_panel()
-        self._start_indicator_hot_reload()
+        if os.environ.get("PYSUPERCHART_NO_RELOAD") != "1":
+            self._start_indicator_hot_reload()
         self._recompute_indicators(immediate=True, reason="view")
 
     def _setup_strategy_system(self) -> None:
         self._load_strategy_definitions()
-        self._start_strategy_hot_reload()
+        if os.environ.get("PYSUPERCHART_NO_RELOAD") != "1":
+            self._start_strategy_hot_reload()
         if self.strategy_panel is not None:
             try:
                 self.strategy_panel.set_strategies(self._build_strategy_panel_items())
@@ -778,12 +784,20 @@ class ChartView(QWidget):
     def _start_indicator_hot_reload(self) -> None:
         if self._indicator_hot_reload is not None:
             return
-        self._indicator_hot_reload = start_watcher(
+        self._indicator_hot_reload = start_fs_watcher(
             self._indicator_paths,
-            self._on_indicators_updated,
-            self._on_indicator_error,
-            poll_interval=1.0,
+            on_change=self._reload_indicators_now,
+            on_error=self._on_indicator_error,
+            debounce_ms=80,
         )
+
+    def _reload_indicators_now(self) -> None:
+        try:
+            indicators = discover_indicators(self._indicator_paths)
+        except Exception as exc:
+            self._on_indicator_error(str(exc))
+            return
+        self._on_indicators_updated(indicators)
 
     def _start_indicator_compute_worker(self, tasks: list, reason: str) -> None:
         self._indicator_compute_seq += 1
@@ -1110,12 +1124,20 @@ class ChartView(QWidget):
     def _start_strategy_hot_reload(self) -> None:
         if self._strategy_hot_reload is not None:
             return
-        self._strategy_hot_reload = start_strategy_watcher(
+        self._strategy_hot_reload = start_fs_watcher(
             self._strategy_paths,
-            self._on_strategies_updated,
-            self._on_strategy_error,
-            poll_interval=1.0,
+            on_change=self._reload_strategies_now,
+            on_error=self._on_strategy_error,
+            debounce_ms=80,
         )
+
+    def _reload_strategies_now(self) -> None:
+        try:
+            strategies = discover_strategies(self._strategy_paths)
+        except Exception as exc:
+            self._on_strategy_error(str(exc))
+            return
+        self._on_strategies_updated(strategies)
 
     def _on_strategies_updated(self, strategies: List[StrategyInfo]) -> None:
         self._strategy_defs = {info.strategy_id: info for info in strategies}
@@ -1209,10 +1231,21 @@ class ChartView(QWidget):
             commission_bps=float(run_cfg.get("commission_bps", 0.0)),
             slippage_bps=float(run_cfg.get("slippage_bps", 0.0)),
         )
+        try:
+            setattr(config, "allow_fetch", bool(run_cfg.get("allow_fetch", True)))
+        except Exception:
+            pass
         self._strategy_cancel_requested = False
         if self._strategy_worker is not None and self._strategy_worker.isRunning():
             self._report_error("Strategy backtest already running")
             return
+        if self.strategy_panel is not None:
+            try:
+                self.strategy_panel.set_running(True)
+                self.strategy_panel.set_status("Starting...")
+                self.strategy_panel.set_progress(0, 1)
+            except Exception:
+                pass
         worker = StrategyBacktestWorker(
             self.store,
             info,
@@ -1224,10 +1257,33 @@ class ChartView(QWidget):
         self._strategy_worker = worker
         worker.finished.connect(lambda status, result, bars_np: self._on_strategy_finished(status, result, info, resolved, config, bars_np))
         worker.error.connect(lambda msg: self._report_error(f"Backtest failed: {msg}"))
+        worker.progress.connect(self._on_strategy_progress)
+        worker.stage.connect(self._on_strategy_stage)
         worker.start()
 
     def _on_strategy_stop_requested(self) -> None:
         self._strategy_cancel_requested = True
+        if self.strategy_panel is not None:
+            try:
+                self.strategy_panel.set_status("Cancel requested...")
+            except Exception:
+                pass
+
+    def _on_strategy_progress(self, i: int, n: int) -> None:
+        if self.strategy_panel is None:
+            return
+        try:
+            self.strategy_panel.set_progress(i, n)
+        except Exception:
+            pass
+
+    def _on_strategy_stage(self, text: str) -> None:
+        if self.strategy_panel is None:
+            return
+        try:
+            self.strategy_panel.set_status(str(text))
+        except Exception:
+            pass
 
     def _on_strategy_finished(self, status: str, result, info: StrategyInfo, params: dict, config: RunConfig, bars_np: np.ndarray) -> None:
         if self._strategy_finish_in_progress:
@@ -1268,6 +1324,11 @@ class ChartView(QWidget):
             store = None
         if store is not None:
             try:
+                if self.strategy_panel is not None:
+                    try:
+                        self.strategy_panel.set_status("Persisting...")
+                    except Exception:
+                        pass
                 run_payload = {
                     "run_id": run_id,
                     "created_at": int(time.time() * 1000),
@@ -1334,20 +1395,49 @@ class ChartView(QWidget):
                     equity_points=equity_payload,
                     messages=messages_payload,
                 )
+                # Optional debug-only integrity verification.
+                try:
+                    if os.environ.get("PYSUPERCHART_VERIFY_RUN", "").strip() == "1":
+                        ok, issues, stats = store.verify_run(run_id)
+                        if not ok:
+                            msg = f"StrategyStore.verify_run failed for {run_id}: issues={issues} stats={stats}"
+                            if self.error_sink is not None:
+                                try:
+                                    self.error_sink.append_error(msg)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
             except Exception:
                 pass
         report.run_id = run_id
         def _apply_report():
             try:
                 if self.strategy_report is not None:
+                    try:
+                        if store is not None:
+                            self.strategy_report.set_store(store)
+                            self.strategy_report.set_context(config.symbol, config.timeframe, info.strategy_id)
+                    except Exception:
+                        pass
                     self.strategy_report.set_report(report)
             except Exception:
                 pass
             try:
-                # Temporarily disabled marker overlay to isolate recursion
-                pass
+                # Strategy overlay is behind a flag while we harden against re-entrancy/recursion.
+                if os.environ.get("PYSUPERCHART_ENABLE_STRATEGY_OVERLAY", "").strip() == "1":
+                    try:
+                        self.candles.set_strategy_markers(list(getattr(report, "markers", [])))
+                    except Exception:
+                        pass
             except Exception:
                 pass
+            if self.strategy_panel is not None:
+                try:
+                    self.strategy_panel.set_status(f"Done ({status})")
+                    self.strategy_panel.set_running(False)
+                except Exception:
+                    pass
             self._strategy_finish_in_progress = False
         try:
             QTimer.singleShot(0, _apply_report)
@@ -2333,6 +2423,8 @@ class ChartView(QWidget):
             self._start_candle_normalize(bars, auto_range)
 
     def _start_live_stream(self) -> None:
+        if os.environ.get("PYSUPERCHART_NO_LIVE") == "1":
+            return
         symbol = self.symbol_box.currentText() or 'BTCUSDT'
         timeframe = self.current_timeframe
         self.candles.set_timeframe(timeframe)
@@ -2366,14 +2458,12 @@ class ChartView(QWidget):
         if self._indicator_hot_reload is not None:
             try:
                 self._indicator_hot_reload.stop()
-                self._indicator_hot_reload.wait(1500)
             except Exception:
                 pass
             self._indicator_hot_reload = None
         if self._strategy_hot_reload is not None:
             try:
                 self._strategy_hot_reload.stop()
-                self._strategy_hot_reload.wait(1500)
             except Exception:
                 pass
             self._strategy_hot_reload = None
@@ -2737,6 +2827,18 @@ class ChartView(QWidget):
             visible_bars = span / tf_ms if tf_ms > 0 else None
         except Exception:
             pass
+
+        # Keep strategy UI widgets in sync (resolved range + report x-range) without adding more timers/signals.
+        if view_range is not None:
+            try:
+                ts_min = int(view_range[0])
+                ts_max = int(view_range[1])
+                if self.strategy_panel is not None:
+                    self.strategy_panel.set_resolved_visible_range(ts_min, ts_max)
+                if self.strategy_report is not None:
+                    self.strategy_report.set_visible_range(ts_min, ts_max)
+            except Exception:
+                pass
 
         def fmt_ts(ts: Optional[int]) -> str:
             if ts is None:

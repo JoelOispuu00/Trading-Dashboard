@@ -6,7 +6,7 @@ import importlib.util
 import os
 from typing import Dict, Iterable, List, Optional
 
-from core.hot_reload import start_generic_watcher, GenericHotReloadWorker
+from core.hot_reload import start_watcher, FileHashHotReloadWorker
 from core.strategies.schema import validate_schema
 
 
@@ -111,8 +111,9 @@ def start_strategy_watcher(
     on_change,
     on_error,
     poll_interval: float = 1.0,
-) -> Optional[GenericHotReloadWorker]:
-    return start_generic_watcher(discover_strategies, root_paths, on_change, on_error, poll_interval=poll_interval)
+) -> Optional[FileHashHotReloadWorker]:
+    # Only watch file hashes on the worker thread. Strategy discovery/import must run on UI thread.
+    return start_watcher(root_paths, on_change, on_error, poll_interval=poll_interval)
 
 
 def _load_module_from_path(path: str) -> Optional[object]:

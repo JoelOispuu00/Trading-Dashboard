@@ -6,6 +6,8 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
 from ui.main_window import MainWindow
 
+_FAULT_LOG_HANDLE = None
+
 def _install_exception_logging() -> None:
     log_path = os.path.join(os.path.dirname(__file__), "exception.log")
     def _hook(exc_type, exc_value, exc_tb):
@@ -28,9 +30,15 @@ def _install_exception_logging() -> None:
 def main():
     try:
         log_path = os.path.join(os.path.dirname(__file__), "faulthandler.log")
-        faulthandler.enable(open(log_path, "a"))
+        # Keep the handle alive for the process lifetime; faulthandler may write later.
+        global _FAULT_LOG_HANDLE
+        # Overwrite each run so logs reflect the current crash, not stale history.
+        _FAULT_LOG_HANDLE = open(log_path, "w", encoding="utf-8")
+        _FAULT_LOG_HANDLE.write(f"pid={os.getpid()}\n")
+        _FAULT_LOG_HANDLE.flush()
+        faulthandler.enable(_FAULT_LOG_HANDLE, all_threads=True)
     except Exception:
-        faulthandler.enable()
+        faulthandler.enable(all_threads=True)
     _install_exception_logging()
     app = QApplication([])
     qss_path = os.path.join(os.path.dirname(__file__), 'ui', 'theme', 'app.qss')

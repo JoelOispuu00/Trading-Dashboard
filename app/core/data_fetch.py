@@ -238,26 +238,40 @@ def load_range_bars(
         # End is meaningfully in the future; treat as user/config error for deterministic backtests.
         raise ValueError(f"Backtest end_ts is in the future: {end_ms} > {now_ms}")
 
-    def _missing_ranges(rows: List[List[float]]) -> List[Tuple[int, int]]:
+    def _missing_ranges(rows: List[List[float]]) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]]:
         if not rows:
-            return [(start_ms, end_ms)]
-        missing: List[Tuple[int, int]] = []
+            all_missing = [(start_ms, end_ms)]
+            return all_missing, all_missing, [], []
+        leading: List[Tuple[int, int]] = []
+        gaps: List[Tuple[int, int]] = []
+        trailing: List[Tuple[int, int]] = []
+
         if int(rows[0][0]) > start_ms + int(interval_ms * 0.5):
-            missing.append((start_ms, int(rows[0][0]) - interval_ms))
+            leading.append((start_ms, int(rows[0][0]) - interval_ms))
         prev_ts = int(rows[0][0])
         for row in rows[1:]:
             ts = int(row[0])
             if interval_ms > 0 and ts - prev_ts > interval_ms * 1.5:
-                missing.append((prev_ts + interval_ms, ts - interval_ms))
+                gaps.append((prev_ts + interval_ms, ts - interval_ms))
             prev_ts = ts
         if int(rows[-1][0]) < end_ms - int(interval_ms * 0.5):
-            missing.append((int(rows[-1][0]) + interval_ms, end_ms))
+            trailing.append((int(rows[-1][0]) + interval_ms, end_ms))
+
         # Keep single-bar gaps (s == e) so the loader can fetch/validate them deterministically.
-        return [(s, e) for s, e in missing if s <= e]
+        def _norm(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+            return [(int(s), int(e)) for s, e in ranges if int(s) <= int(e)]
+
+        leading = _norm(leading)
+        gaps = _norm(gaps)
+        trailing = _norm(trailing)
+
+        # Encode categories in the message, but keep fetch loop using a flat list.
+        all_missing = leading + gaps + trailing
+        return all_missing, leading, gaps, trailing
 
     cached = store.load_bars(exchange, symbol, timeframe, start_ms, end_ms)
     cached_list = [list(row) for row in cached]
-    missing = _missing_ranges(cached_list)
+    missing, leading, gaps, trailing = _missing_ranges(cached_list)
     if missing and allow_fetch:
         # Iterate: fetching a range can still leave gaps (rate limits, provider limits).
         for _ in range(3):
@@ -271,9 +285,10 @@ def load_range_bars(
                     store.store_bars(exchange, symbol, timeframe, bars)
             cached = store.load_bars(exchange, symbol, timeframe, start_ms, end_ms)
             cached_list = [list(row) for row in cached]
-            missing = _missing_ranges(cached_list)
+            missing, leading, gaps, trailing = _missing_ranges(cached_list)
     if missing:
-        raise ValueError(f"Missing OHLCV data for range {start_ms}-{end_ms}: {missing}")
+        # Stable, user-facing formatting: leading/gaps/trailing.
+        raise ValueError(f"Missing OHLCV data: leading={leading} gaps={gaps} trailing={trailing}")
     return cached_list
 
 

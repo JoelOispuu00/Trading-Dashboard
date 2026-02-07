@@ -1,62 +1,67 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from bisect import bisect_left, bisect_right
+from typing import Any, Dict, List, Optional
 
 import pyqtgraph as pg
-from PyQt6.QtGui import QPainter, QPicture, QColor
-from PyQt6.QtCore import QRectF
-from PyQt6.QtCore import QPointF
+from PyQt6.QtCore import QPointF, QRectF
+from PyQt6.QtGui import QColor, QPainter, QPicture
 
 
 class StrategyOverlayRenderer(pg.GraphicsObject):
-    def __init__(self, markers: List[Dict], get_index_for_ts=None) -> None:
+    """
+    Lightweight marker overlay for backtest entries/exits.
+
+    Important constraints:
+    - Paint must be "dumb draw" (no viewbox queries, no range changes) to avoid feedback loops.
+    - We keep markers sorted by ts and use the exposed rect (in item coords) to draw only visible chunks.
+    """
+
+    def __init__(self, markers: List[Dict[str, Any]]) -> None:
         super().__init__()
-        self._markers = markers
+        self._markers: List[Dict[str, Any]] = []
+        self._marker_ts: List[float] = []
         self._chunk_size = 400
         self._chunk_cache: Dict[int, QPicture] = {}
-        self._get_index_for_ts = get_index_for_ts
         self._ts_cache: Optional[List[float]] = None
         self._bounds = QRectF()
+        self.set_markers(markers)
 
     def set_ts_cache(self, ts_cache: List[float]) -> None:
         self._ts_cache = ts_cache
-        self._chunk_cache = {}
+        self._chunk_cache.clear()
+        self.prepareGeometryChange()
         self._bounds = self._compute_bounds()
         self.update()
 
-    def set_markers(self, markers: List[Dict]) -> None:
-        self._markers = markers
-        self._chunk_cache = {}
+    def set_markers(self, markers: List[Dict[str, Any]]) -> None:
+        markers = markers or []
+        self._markers = sorted(markers, key=lambda m: float(m.get("ts", 0.0)))
+        self._marker_ts = [float(m.get("ts", 0.0)) for m in self._markers]
+        self._chunk_cache.clear()
+        self.prepareGeometryChange()
         self._bounds = self._compute_bounds()
         self.update()
 
     def paint(self, painter: QPainter, option, widget) -> None:
         if not self._markers:
             return
+
         try:
-            vb = self.getViewBox()
+            exposed: QRectF = option.exposedRect  # type: ignore[attr-defined]
+            x_min = float(exposed.left())
+            x_max = float(exposed.right())
         except Exception:
-            vb = None
-        if vb is not None:
-            try:
-                (x_range, _) = vb.viewRange()
-                x_min, x_max = x_range
-            except Exception:
-                x_min = None
-                x_max = None
-        else:
-            x_min = x_max = None
+            x_min = float(self._marker_ts[0])
+            x_max = float(self._marker_ts[-1])
 
-        markers = self._markers
-        if x_min is not None and x_max is not None:
-            markers = [m for m in markers if x_min <= m.get("ts", 0) <= x_max]
-
-        if not markers:
+        i0 = bisect_left(self._marker_ts, x_min)
+        i1 = bisect_right(self._marker_ts, x_max)
+        if i1 <= i0:
             return
 
-        total = len(markers)
-        start_chunk = 0
-        end_chunk = (total - 1) // self._chunk_size
+        start_chunk = i0 // self._chunk_size
+        end_chunk = (i1 - 1) // self._chunk_size
         for chunk_idx in range(start_chunk, end_chunk + 1):
             picture = self._chunk_cache.get(chunk_idx)
             if picture is None:
@@ -71,10 +76,9 @@ class StrategyOverlayRenderer(pg.GraphicsObject):
         if not self._markers:
             return QRectF()
         try:
-            ts_vals = [float(m.get("ts", 0)) for m in self._markers]
-            price_vals = [float(m.get("price", 0)) for m in self._markers]
-            min_ts = min(ts_vals)
-            max_ts = max(ts_vals)
+            min_ts = float(self._marker_ts[0])
+            max_ts = float(self._marker_ts[-1])
+            price_vals = [float(m.get("price", 0.0)) for m in self._markers]
             min_p = min(price_vals)
             max_p = max(price_vals)
             if max_ts == min_ts:
@@ -92,13 +96,14 @@ class StrategyOverlayRenderer(pg.GraphicsObject):
             start = chunk_idx * self._chunk_size
             end = min(len(self._markers), start + self._chunk_size)
             for marker in self._markers[start:end]:
-                ts = float(marker.get("ts", 0))
-                price = float(marker.get("price", 0))
-                kind = marker.get("kind", "entry")
-                side = marker.get("side", "LONG")
-                color = QColor('#22C55E') if side == "LONG" else QColor('#EF5350')
+                ts = float(marker.get("ts", 0.0))
+                price = float(marker.get("price", 0.0))
+                kind = str(marker.get("kind", "entry"))
+                side = str(marker.get("side", "LONG")).upper()
+                color = QColor("#22C55E") if side == "LONG" else QColor("#EF5350")
                 painter.setPen(pg.mkPen(color))
                 painter.setBrush(pg.mkBrush(color))
+
                 size = 6.0
                 if kind == "entry":
                     points = [
@@ -116,3 +121,4 @@ class StrategyOverlayRenderer(pg.GraphicsObject):
         finally:
             painter.end()
         return picture
+

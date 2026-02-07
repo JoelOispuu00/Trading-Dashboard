@@ -280,6 +280,51 @@ class BacktestCoreTests(unittest.TestCase):
         self.assertEqual(len(result.trades), 1)
         self.assertEqual(result.trades[0].exit_ts, 1)
 
+    def test_cancel_forces_close_and_status_canceled(self):
+        bars = np.array(
+            [
+                [0, 10, 12, 9, 11, 100],
+                [1, 11, 13, 10, 12, 100],
+                [2, 12, 14, 11, 13, 100],  # cancel after we open
+                [3, 13, 15, 12, 14, 100],
+                [4, 14, 16, 13, 15, 100],
+            ],
+            dtype=np.float64,
+        )
+
+        def on_bar(ctx, i):
+            if i == 0:
+                ctx.buy(1.0)
+            # Never flatten; cancel should force-close.
+
+        module = _make_module(on_bar)
+        cfg = RunConfig(
+            symbol="TEST",
+            timeframe="1m",
+            start_ts=0,
+            end_ts=4,
+            warmup_bars=0,
+            initial_cash=1000.0,
+            leverage=1.0,
+            commission_bps=100.0,  # 1%
+            slippage_bps=100.0,    # 1%
+            close_on_finish=True,
+        )
+        # Cancel after a couple of bars so the entry can fill first.
+        called = {"n": 0}
+
+        def cancel_flag():
+            called["n"] += 1
+            return called["n"] >= 3
+
+        result, status = run_backtest(bars, module, {}, cfg, cancel_flag=cancel_flag)
+        self.assertEqual(status, "CANCELED")
+        self.assertEqual(len(result.trades), 1)
+        trade = result.trades[0]
+        # Forced close is close-based with slippage and fees.
+        self.assertGreater(trade.fee_total, 0.0)
+        self.assertTrue(np.isfinite(trade.pnl))
+
     def test_determinism(self):
         bars = np.array(
             [

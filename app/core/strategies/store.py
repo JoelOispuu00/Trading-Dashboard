@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from .models import Trade
+from .report import StrategyReport, build_report
 
 
 class StrategyStore:
@@ -275,6 +278,89 @@ class StrategyStore:
             )
             conn.commit()
 
+    def list_recent_runs(self, *, symbol: str, timeframe: str, strategy_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._connect()
+            cur = conn.execute(
+                """
+                SELECT run_id, created_at, status, start_ts, end_ts
+                FROM strategy_runs
+                WHERE symbol=? AND timeframe=? AND strategy_id=?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (symbol, timeframe, strategy_id, int(limit)),
+            )
+            rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append({
+                "run_id": r[0],
+                "created_at": r[1],
+                "status": r[2],
+                "start_ts": r[3],
+                "end_ts": r[4],
+            })
+        return out
+
+    def load_run_report(self, run_id: str) -> Optional[StrategyReport]:
+        if not run_id:
+            return None
+        with self._lock:
+            conn = self._connect()
+            tcur = conn.execute(
+                """
+                SELECT side, size, entry_ts, entry_price, exit_ts, exit_price, pnl, fee_total, bars_held
+                FROM strategy_trades
+                WHERE run_id=?
+                ORDER BY entry_ts ASC
+                """,
+                (run_id,),
+            )
+            trades_rows = tcur.fetchall()
+            ecur = conn.execute(
+                """
+                SELECT ts, equity, drawdown
+                FROM strategy_equity
+                WHERE run_id=?
+                ORDER BY ts ASC
+                """,
+                (run_id,),
+            )
+            equity_rows = ecur.fetchall()
+
+        trades: List[Trade] = []
+        for r in trades_rows:
+            try:
+                trades.append(
+                    Trade(
+                        side=str(r[0]),
+                        size=float(r[1]),
+                        entry_ts=int(r[2]),
+                        entry_price=float(r[3]),
+                        exit_ts=int(r[4]),
+                        exit_price=float(r[5]),
+                        pnl=float(r[6]),
+                        fee_total=float(r[7]),
+                        bars_held=int(r[8]),
+                    )
+                )
+            except Exception:
+                continue
+
+        equity_ts: List[int] = []
+        equity: List[float] = []
+        drawdown: List[float] = []
+        for r in equity_rows:
+            try:
+                equity_ts.append(int(r[0]))
+                equity.append(float(r[1]))
+                drawdown.append(float(r[2]))
+            except Exception:
+                continue
+
+        return build_report(run_id=run_id, trades=trades, equity_ts=equity_ts, equity=equity, drawdown=drawdown)
+
     def insert_equity_point(self, run_id: str, point: Dict[str, Any]) -> None:
         with self._lock:
             conn = self._connect()
@@ -398,3 +484,166 @@ class StrategyStore:
             )
             row = cur.fetchone()
             return row[0] if row else None
+
+    @staticmethod
+    def _timeframe_to_ms(timeframe: str) -> int:
+        # Keep local to avoid importing chart/data modules from core.strategies.
+        if not timeframe:
+            return 60_000
+        unit = timeframe[-1].lower()
+        try:
+            mult = int(timeframe[:-1])
+        except Exception:
+            return 60_000
+        if unit == "m":
+            return mult * 60_000
+        if unit == "h":
+            return mult * 3_600_000
+        if unit == "d":
+            return mult * 86_400_000
+        if unit == "w":
+            return mult * 7 * 86_400_000
+        return 60_000
+
+    def verify_run(self, run_id: str) -> Tuple[bool, List[str], Dict[str, Any]]:
+        """
+        Lightweight integrity check to catch partial/corrupt runs (e.g. crash mid-persist).
+        Intended for debug use, not for every UI refresh.
+        """
+        issues: List[str] = []
+        stats: Dict[str, Any] = {"run_id": run_id}
+        if not run_id:
+            return False, ["missing run_id"], stats
+
+        with self._lock:
+            conn = self._connect()
+            rcur = conn.execute(
+                """
+                SELECT status, start_ts, end_ts, warmup_bars, timeframe
+                FROM strategy_runs
+                WHERE run_id=?
+                """,
+                (run_id,),
+            )
+            run_rows = rcur.fetchall()
+            if len(run_rows) != 1:
+                issues.append(f"strategy_runs rows != 1 (got {len(run_rows)})")
+                return False, issues, stats
+
+            status, start_ts, end_ts, warmup_bars, timeframe = run_rows[0]
+            status = str(status or "")
+            try:
+                start_ts = int(start_ts)
+                end_ts = int(end_ts)
+                warmup_bars = int(warmup_bars or 0)
+            except Exception:
+                issues.append("invalid run bounds fields (start_ts/end_ts/warmup_bars)")
+                return False, issues, stats
+            tf_ms = self._timeframe_to_ms(str(timeframe or ""))
+            warmup_start = int(start_ts - (warmup_bars * tf_ms))
+            stats.update({"status": status, "start_ts": start_ts, "end_ts": end_ts, "warmup_start_ts": warmup_start})
+
+            def _count(table: str) -> int:
+                try:
+                    return int(conn.execute(f"SELECT COUNT(1) FROM {table} WHERE run_id=?", (run_id,)).fetchone()[0])
+                except Exception:
+                    return -1
+
+            eq_count = _count("strategy_equity")
+            ord_count = _count("strategy_orders")
+            trd_count = _count("strategy_trades")
+            msg_count = _count("strategy_messages")
+            stats.update(
+                {
+                    "equity_rows": eq_count,
+                    "order_rows": ord_count,
+                    "trade_rows": trd_count,
+                    "message_rows": msg_count,
+                }
+            )
+
+            if status in ("DONE", "CANCELED") and eq_count <= 0:
+                issues.append("strategy_equity rows == 0 for completed run")
+
+            # Equity ts monotonic and within bounds.
+            if eq_count > 0:
+                ecur = conn.execute(
+                    """
+                    SELECT ts, equity, drawdown
+                    FROM strategy_equity
+                    WHERE run_id=?
+                    ORDER BY ts ASC
+                    """,
+                    (run_id,),
+                )
+                prev_ts: Optional[int] = None
+                min_ts: Optional[int] = None
+                max_ts: Optional[int] = None
+                bad_dd = 0
+                non_finite = 0
+                for ts, eq, dd in ecur.fetchall():
+                    try:
+                        ts_i = int(ts)
+                    except Exception:
+                        issues.append("non-integer equity ts")
+                        break
+                    if prev_ts is not None and ts_i <= prev_ts:
+                        issues.append("equity ts not strictly increasing")
+                        break
+                    prev_ts = ts_i
+                    if min_ts is None or ts_i < min_ts:
+                        min_ts = ts_i
+                    if max_ts is None or ts_i > max_ts:
+                        max_ts = ts_i
+                    try:
+                        eq_f = float(eq)
+                        dd_f = float(dd)
+                        if not (eq_f == eq_f and abs(eq_f) != float("inf")):
+                            non_finite += 1
+                        if not (dd_f == dd_f and abs(dd_f) != float("inf")):
+                            non_finite += 1
+                        if dd_f < 0.0 or dd_f > 1.0:
+                            bad_dd += 1
+                    except Exception:
+                        non_finite += 1
+                stats.update({"equity_min_ts": min_ts, "equity_max_ts": max_ts, "equity_bad_dd": bad_dd, "equity_non_finite": non_finite})
+                if min_ts is not None and min_ts < warmup_start:
+                    issues.append("equity ts before warmup_start")
+                if max_ts is not None and max_ts > end_ts:
+                    issues.append("equity ts after end_ts")
+                if bad_dd:
+                    issues.append(f"equity drawdown out of range (count={bad_dd})")
+                if non_finite:
+                    issues.append(f"equity non-finite values (count={non_finite})")
+
+            # Orders and trades: required fields non-null.
+            # This is intentionally minimal; deeper semantic checks live in unit tests.
+            o_bad = 0
+            for row in conn.execute(
+                """
+                SELECT submitted_ts, side, size, status
+                FROM strategy_orders
+                WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchall():
+                submitted_ts, side, size, ostatus = row
+                if submitted_ts is None or side is None or size is None or ostatus is None:
+                    o_bad += 1
+            if o_bad:
+                issues.append(f"orders missing required fields (count={o_bad})")
+            t_bad = 0
+            for row in conn.execute(
+                """
+                SELECT side, size, entry_ts, entry_price, exit_ts, exit_price, pnl, fee_total
+                FROM strategy_trades
+                WHERE run_id=?
+                """,
+                (run_id,),
+            ).fetchall():
+                if any(v is None for v in row):
+                    t_bad += 1
+            if t_bad:
+                issues.append(f"trades missing required fields (count={t_bad})")
+
+        return (len(issues) == 0), issues, stats

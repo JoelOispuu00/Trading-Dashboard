@@ -170,3 +170,14 @@
 - Added a minimal headless backtest runner (`core.strategies.cli`) for debugging without the GUI.
 - Headless CLI fetches missing OHLCV segments by default (use `--no-fetch` to hard-fail on gaps).
 - Strategy backtests now respect the date range pickers when "Use visible range" is unchecked (no clamping to the currently-loaded chart window).
+
+## 0.8.2
+- Polished strategy UI docks to match the app theme: grouped range/config sections, presets, resolved visible-range display, allow-fetch toggle, progress/status, run history selector, and CSV exports.
+- Made Strategy Panel and Strategy Report docks scrollable so they can shrink without blocking other bottom docks from resizing.
+- Improved crash diagnostics: `app/faulthandler.log` is reset each run and captures all threads; unhandled exceptions are persisted to `app/exception.log`.
+- Stabilized indicator/strategy hot reload on Windows by preferring filesystem notifications (debounced) over high-frequency polling threads; added env toggles to disable reload/live streams for debugging.
+- Added `StrategyStore.verify_run()` (opt-in) to detect partial/corrupt run bundles after persistence (`PYSUPERCHART_VERIFY_RUN=1`).
+- Improved backtest missing-data errors to classify missing coverage as `leading` / `gaps` / `trailing` and deduped repeated identical errors in the error dock.
+- Indicator hot reload now keeps the last valid indicator definition visible if a file breaks on reload (parity with strategies).
+- Fixed Strategy overlay renderer chunking logic and re-enabled overlay rendering behind `PYSUPERCHART_ENABLE_STRATEGY_OVERLAY=1` (default remains off while validating stability).
+- Extended headless CLI with a deterministic synthetic stress mode (`--stress-bars`) and optional persistence for large-run scale checks.

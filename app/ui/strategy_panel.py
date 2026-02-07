@@ -2,6 +2,8 @@
 
 from typing import Dict, List, Optional
 
+from datetime import datetime, timezone
+
 from PyQt6.QtCore import Qt, pyqtSignal, QDateTime
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -9,11 +11,15 @@ from PyQt6.QtWidgets import (
     QDockWidget,
     QDoubleSpinBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -30,42 +36,94 @@ class StrategyPanel(QDockWidget):
         self._strategies: Dict[str, dict] = {}
         self._active_strategy_id: Optional[str] = None
         self._param_widgets: Dict[str, object] = {}
+        self._last_resolved_visible: tuple[int, int] | None = None
 
         container = QWidget()
         layout = QVBoxLayout(container)
 
-        layout.addWidget(QLabel("Available Strategies"))
+        title = QLabel("Available Strategies")
+        title.setObjectName("StrategySectionTitle")
+        layout.addWidget(title)
         self.strategy_list = QListWidget()
+        self.strategy_list.setObjectName("StrategyList")
+        self.strategy_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.strategy_list.setMinimumHeight(90)
         self.strategy_list.itemSelectionChanged.connect(self._on_selected)
         layout.addWidget(self.strategy_list)
 
-        layout.addWidget(QLabel("Parameters"))
+        params_group = QGroupBox("Parameters")
+        params_group.setObjectName("StrategyParamsGroup")
+        params_layout_outer = QVBoxLayout(params_group)
         self.params_container = QWidget()
+        self.params_container.setObjectName("StrategyParamsForm")
         self.params_layout = QFormLayout(self.params_container)
         self.params_layout.setContentsMargins(0, 0, 0, 0)
         self.params_layout.setSpacing(6)
-        layout.addWidget(self.params_container)
+        params_layout_outer.addWidget(self.params_container)
+        layout.addWidget(params_group)
 
         self.params_placeholder = QLabel("Select a strategy to edit parameters.")
         self.params_placeholder.setWordWrap(True)
-        layout.addWidget(self.params_placeholder)
+        params_layout_outer.addWidget(self.params_placeholder)
 
-        layout.addWidget(QLabel("Run Config"))
+        run_group = QGroupBox("Backtest Range")
+        run_group.setObjectName("StrategyRangeGroup")
+        run_layout = QVBoxLayout(run_group)
+
         self.use_visible_range = QCheckBox("Use visible range")
+        self.use_visible_range.setObjectName("StrategyUseVisibleRange")
         self.use_visible_range.setChecked(True)
         self.use_visible_range.toggled.connect(self._sync_range_controls)
-        layout.addWidget(self.use_visible_range)
+        run_layout.addWidget(self.use_visible_range)
+
+        self.resolved_range_label = QLabel("Resolved range (UTC): n/a")
+        self.resolved_range_label.setObjectName("StrategyResolvedRange")
+        self.resolved_range_label.setVisible(True)
+        run_layout.addWidget(self.resolved_range_label)
 
         self.start_picker = QDateTimeEdit()
+        self.start_picker.setObjectName("StrategyStartPicker")
         self.start_picker.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         self.start_picker.setCalendarPopup(True)
         self.end_picker = QDateTimeEdit()
+        self.end_picker.setObjectName("StrategyEndPicker")
         self.end_picker.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
         self.end_picker.setCalendarPopup(True)
         now = QDateTime.currentDateTime()
         self.start_picker.setDateTime(now.addDays(-7))
         self.end_picker.setDateTime(now)
         self._sync_range_controls(self.use_visible_range.isChecked())
+
+        range_form = QFormLayout()
+        range_form.setContentsMargins(0, 0, 0, 0)
+        range_form.addRow("Start (UTC)", self.start_picker)
+        range_form.addRow("End (UTC)", self.end_picker)
+        run_layout.addLayout(range_form)
+
+        presets_row = QHBoxLayout()
+        presets_row.setSpacing(6)
+        self.preset_1d = QPushButton("1D")
+        self.preset_7d = QPushButton("7D")
+        self.preset_30d = QPushButton("30D")
+        self.preset_90d = QPushButton("90D")
+        self.preset_1y = QPushButton("1Y")
+        for b in (self.preset_1d, self.preset_7d, self.preset_30d, self.preset_90d, self.preset_1y):
+            b.setObjectName("StrategyPresetButton")
+            b.clicked.connect(lambda _=False, btn=b: self._apply_preset(btn.text()))
+            presets_row.addWidget(b)
+        presets_row.addStretch(1)
+        run_layout.addLayout(presets_row)
+
+        self.allow_fetch = QCheckBox("Allow fetch missing data")
+        self.allow_fetch.setObjectName("StrategyAllowFetch")
+        self.allow_fetch.setChecked(True)
+        run_layout.addWidget(self.allow_fetch)
+
+        layout.addWidget(run_group)
+
+        config_group = QGroupBox("Run Config")
+        config_group.setObjectName("StrategyConfigGroup")
+        config_layout = QVBoxLayout(config_group)
 
         self.warmup_spin = QSpinBox()
         self.warmup_spin.setRange(0, 10000)
@@ -90,34 +148,59 @@ class StrategyPanel(QDockWidget):
         self.slippage_spin.setSuffix(" bps")
 
         config_form = QFormLayout()
-        config_form.addRow("Start", self.start_picker)
-        config_form.addRow("End", self.end_picker)
         config_form.addRow("Warmup bars", self.warmup_spin)
         config_form.addRow("Initial cash", self.initial_cash_spin)
         config_form.addRow("Leverage", self.leverage_spin)
         config_form.addRow("Commission", self.commission_spin)
         config_form.addRow("Slippage", self.slippage_spin)
-        layout.addLayout(config_form)
+        config_layout.addLayout(config_form)
+
+        self.status_label = QLabel("Idle")
+        self.status_label.setObjectName("StrategyRunStatus")
+        config_layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setObjectName("StrategyRunProgress")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(True)
+        config_layout.addWidget(self.progress)
+
+        layout.addWidget(config_group)
 
         btn_row = QHBoxLayout()
         self.run_button = QPushButton("Run Backtest")
+        self.run_button.setObjectName("StrategyRunButton")
         self.run_button.clicked.connect(self._emit_run)
-        self.stop_button = QPushButton("Stop")
+        self.stop_button = QPushButton("Cancel")
+        self.stop_button.setObjectName("StrategyCancelButton")
+        self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_requested.emit)
         self.reset_button = QPushButton("Reset Params")
+        self.reset_button.setObjectName("StrategyResetButton")
         self.reset_button.clicked.connect(self._reset_params)
         btn_row.addWidget(self.run_button)
         btn_row.addWidget(self.stop_button)
         btn_row.addWidget(self.reset_button)
         layout.addLayout(btn_row)
 
-        self.setWidget(container)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setObjectName("StrategyPanelScroll")
+        scroll.setWidget(container)
+        self.setWidget(scroll)
         self.params_container.setVisible(False)
+        self.params_placeholder.setVisible(True)
 
     def _sync_range_controls(self, use_visible: bool) -> None:
         # If using the visible window, the date pickers are ignored.
         self.start_picker.setEnabled(not use_visible)
         self.end_picker.setEnabled(not use_visible)
+        # Preset buttons are created slightly later in __init__.
+        if hasattr(self, "preset_1d"):
+            for b in (self.preset_1d, self.preset_7d, self.preset_30d, self.preset_90d, self.preset_1y):
+                b.setEnabled(not use_visible)
 
     def set_strategies(self, strategies: List[dict]) -> None:
         self._strategies = {s["strategy_id"]: s for s in strategies}
@@ -225,7 +308,11 @@ class StrategyPanel(QDockWidget):
             "leverage": float(self.leverage_spin.value()),
             "commission_bps": float(self.commission_spin.value()),
             "slippage_bps": float(self.slippage_spin.value()),
+            "allow_fetch": bool(self.allow_fetch.isChecked()),
         }
+        self.set_running(True)
+        self.set_status("Starting...")
+        self.set_progress(0, 1)
         self.run_requested.emit(self._active_strategy_id, params, run_cfg)
 
     def _reset_params(self) -> None:
@@ -235,3 +322,56 @@ class StrategyPanel(QDockWidget):
         if not info:
             return
         self._render_params(info)
+
+    def set_running(self, running: bool) -> None:
+        self.run_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+        self.reset_button.setEnabled(not running)
+        self.strategy_list.setEnabled(not running)
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def set_progress(self, i: int, n: int) -> None:
+        try:
+            if n <= 0:
+                self.progress.setValue(0)
+                return
+            pct = int(max(0.0, min(1.0, float(i) / float(n))) * 100.0)
+            self.progress.setValue(pct)
+        except Exception:
+            pass
+
+    def set_resolved_visible_range(self, ts_min: int, ts_max: int) -> None:
+        if self._last_resolved_visible == (ts_min, ts_max):
+            return
+        self._last_resolved_visible = (ts_min, ts_max)
+        if not self.use_visible_range.isChecked():
+            return
+        self.resolved_range_label.setText(
+            f"Resolved range (UTC): {self._fmt_utc(ts_min)}  ->  {self._fmt_utc(ts_max)}"
+        )
+
+    def _apply_preset(self, label: str) -> None:
+        # Presets apply in UTC by setting relative offsets from "now" (local clock), then UI labels clarify UTC.
+        # This keeps the control simple while the engine uses epoch ms (UTC).
+        now = QDateTime.currentDateTime()
+        if label == "1D":
+            self.start_picker.setDateTime(now.addDays(-1))
+        elif label == "7D":
+            self.start_picker.setDateTime(now.addDays(-7))
+        elif label == "30D":
+            self.start_picker.setDateTime(now.addDays(-30))
+        elif label == "90D":
+            self.start_picker.setDateTime(now.addDays(-90))
+        elif label == "1Y":
+            self.start_picker.setDateTime(now.addDays(-365))
+        self.end_picker.setDateTime(now)
+
+    @staticmethod
+    def _fmt_utc(ts_ms: int) -> str:
+        try:
+            dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts_ms)

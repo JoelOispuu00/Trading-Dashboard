@@ -196,6 +196,96 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit, QListWidget {
     selection-color: #FFFFFF;
 }
 
+/* Strategy / Backtest UI polish */
+QLabel#StrategySectionTitle {
+    color: #FFFFFF;
+    font-weight: bold;
+    padding: 2px 0px;
+}
+
+QGroupBox {
+    border: 1px solid #2A2E39;
+    border-radius: 4px;
+    margin-top: 8px;
+    padding: 8px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0px 6px;
+    color: #B2B5BE;
+    background: #131722;
+}
+
+QDateTimeEdit {
+    background-color: #0F141E;
+    border: 1px solid #2A2E39;
+    padding: 2px 8px;
+    min-height: 22px;
+}
+
+QPushButton#StrategyPresetButton {
+    padding: 2px 8px;
+    min-height: 20px;
+}
+
+QLabel#StrategyResolvedRange {
+    color: #7A8090;
+    font-size: 11px;
+}
+
+QLabel#StrategyRunStatus {
+    color: #B2B5BE;
+    padding-top: 4px;
+}
+
+QProgressBar#StrategyRunProgress {
+    border: 1px solid #2A2E39;
+    border-radius: 3px;
+    background: #0F141E;
+    text-align: center;
+    min-height: 18px;
+}
+
+QProgressBar#StrategyRunProgress::chunk {
+    background-color: #2962FF;
+}
+
+QTableWidget#StrategyTradesTable {
+    background-color: #0F141E;
+    border: 1px solid #2A2E39;
+    gridline-color: #2A2E39;
+    selection-background-color: #1A1F2A;
+    selection-color: #FFFFFF;
+}
+
+QHeaderView::section {
+    background-color: #1E222D;
+    color: #B2B5BE;
+    padding: 4px 8px;
+    border: 1px solid #2A2E39;
+}
+
+QComboBox#StrategyRunSelector {
+    min-height: 22px;
+}
+
+QTableCornerButton::section, QTableWidget QTableCornerButton::section, QTableView QTableCornerButton::section {
+    background-color: #1E222D;
+    border: 1px solid #2A2E39;
+}
+
+QAbstractScrollArea::corner {
+    background-color: #1E222D;
+    border: 1px solid #2A2E39;
+}
+
+QScrollArea {
+    border: none;
+    background: #131722;
+}
+
 QComboBox {
     padding: 2px 10px;
     min-height: 22px;

@@ -57,6 +57,7 @@ class RangeLoaderTests(unittest.TestCase):
                 load_range_bars(store, exchange, symbol, timeframe, start, end, allow_fetch=False)
             msg = str(ctx.exception)
             self.assertIn("Missing OHLCV data", msg)
+            self.assertIn("leading=", msg)
             self.assertIn(f"({start}, {2 * interval - interval})", msg)
         finally:
             self._cleanup_db_files(path)
@@ -78,6 +79,7 @@ class RangeLoaderTests(unittest.TestCase):
                 load_range_bars(store, exchange, symbol, timeframe, start, end, allow_fetch=False)
             msg = str(ctx.exception)
             self.assertIn("Missing OHLCV data", msg)
+            self.assertIn("gaps=", msg)
             self.assertIn(f"({6 * interval}, {6 * interval})", msg)
         finally:
             self._cleanup_db_files(path)
@@ -104,6 +106,7 @@ class RangeLoaderTests(unittest.TestCase):
                 load_range_bars(store, exchange, symbol, timeframe, start, end, allow_fetch=False)
             msg = str(ctx.exception)
             self.assertIn("Missing OHLCV data", msg)
+            self.assertIn("trailing=", msg)
             self.assertIn(f"({9 * interval}, {end})", msg)
         finally:
             self._cleanup_db_files(path)
