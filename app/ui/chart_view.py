@@ -773,6 +773,10 @@ class ChartView(QWidget):
         if self.strategy_report is not None:
             try:
                 self.strategy_report.trade_selected.connect(self.jump_to_ts)
+                try:
+                    self.strategy_report.set_error_sink(self.error_sink)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -1171,6 +1175,7 @@ class ChartView(QWidget):
                 "name": info.name,
                 "schema": schema,
                 "params": params,
+                "load_error": getattr(info, "load_error", None),
             })
         return items
 
@@ -1467,6 +1472,7 @@ class ChartView(QWidget):
                     "name": info.name,
                     "inputs": info.inputs,
                     "pane": info.pane,
+                    "load_error": getattr(info, "load_error", None),
                 }
             )
         available.sort(key=lambda item: item["name"].lower())

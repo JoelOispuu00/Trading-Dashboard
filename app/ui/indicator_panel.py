@@ -88,8 +88,13 @@ class IndicatorPanel(QDockWidget):
         self._available = {item["indicator_id"]: item for item in indicators}
         self.indicator_list.clear()
         for info in indicators:
-            item = QListWidgetItem(info["name"])
+            name = info["name"]
+            load_error = info.get("load_error")
+            label = f"{name} (stale)" if load_error else name
+            item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, info["indicator_id"])
+            if load_error:
+                item.setToolTip(str(load_error))
             self.indicator_list.addItem(item)
 
     def set_indicator_instances(self, instances: List[dict], pane_ids: List[str]) -> None:

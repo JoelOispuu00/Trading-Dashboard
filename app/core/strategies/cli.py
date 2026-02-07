@@ -116,6 +116,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Deterministic synthetic bars: gentle trend + bounded wiggle (no randomness).
         ts0 = int(start_ts - int(args.warmup_bars * tf_ms))
         ts = ts0 + (np.arange(n, dtype=np.int64) * int(tf_ms))
+        # In stress mode, ensure the run's end_ts covers the generated data to actually exercise scale paths.
+        end_ts = int(ts[-1])
         base = 100.0 + (np.arange(n, dtype=np.float64) * 0.0001)
         wiggle = 0.5 * np.sin(np.arange(n, dtype=np.float64) * 0.01)
         close = base + wiggle

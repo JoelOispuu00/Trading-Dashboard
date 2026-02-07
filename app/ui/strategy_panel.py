@@ -206,8 +206,15 @@ class StrategyPanel(QDockWidget):
         self._strategies = {s["strategy_id"]: s for s in strategies}
         self.strategy_list.clear()
         for info in strategies:
-            item = QListWidgetItem(info.get("name", info["strategy_id"]))
+            name = info.get("name", info["strategy_id"])
+            load_error = info.get("load_error")
+            label = name
+            if load_error:
+                label = f"{name} (stale)"
+            item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, info["strategy_id"])
+            if load_error:
+                item.setToolTip(str(load_error))
             self.strategy_list.addItem(item)
         if strategies:
             self.strategy_list.setCurrentRow(0)

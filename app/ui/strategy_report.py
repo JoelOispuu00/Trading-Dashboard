@@ -35,6 +35,7 @@ class StrategyReportDock(QDockWidget):
         self.setObjectName("StrategyReportDock")
         self._trades: List = []
         self._store: Optional[StrategyStore] = None
+        self._error_sink = None
         self._context: Optional[Tuple[str, str, str]] = None  # (symbol, timeframe, strategy_id)
         self._run_id_by_index: List[str] = []
 
@@ -90,6 +91,10 @@ class StrategyReportDock(QDockWidget):
 
     def set_store(self, store: StrategyStore) -> None:
         self._store = store
+
+    def set_error_sink(self, sink) -> None:
+        # Expected to be ErrorDock-like: has append_error(str).
+        self._error_sink = sink
 
     def set_context(self, symbol: str, timeframe: str, strategy_id: str) -> None:
         self._context = (symbol, timeframe, strategy_id)
@@ -166,6 +171,18 @@ class StrategyReportDock(QDockWidget):
                 run_id = str(r.get("run_id"))
                 created_at = int(r.get("created_at") or 0)
                 status = str(r.get("status") or "")
+                # Skip corrupted/partial runs (e.g. crash mid-write). Verification is fast enough here.
+                try:
+                    ok, issues, _stats = self._store.verify_run(run_id)
+                except Exception:
+                    ok, issues = True, []
+                if not ok:
+                    try:
+                        if self._error_sink is not None:
+                            self._error_sink.append_error(f"Skipping corrupt strategy run {run_id}: {issues}")
+                    except Exception:
+                        pass
+                    continue
                 label = f"{self._fmt_utc(created_at)}  [{status}]  {run_id}"
                 self.run_selector.addItem(label)
                 self._run_id_by_index.append(run_id)
@@ -186,6 +203,17 @@ class StrategyReportDock(QDockWidget):
         if self._store is None:
             return
         run_id = self._run_id_by_index[idx]
+        try:
+            ok, issues, _stats = self._store.verify_run(run_id)
+            if not ok:
+                if self._error_sink is not None:
+                    try:
+                        self._error_sink.append_error(f"Refusing to load corrupt strategy run {run_id}: {issues}")
+                    except Exception:
+                        pass
+                return
+        except Exception:
+            pass
         report = self._store.load_run_report(run_id)
         if report is not None:
             self.set_report(report)

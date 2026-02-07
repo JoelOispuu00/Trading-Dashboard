@@ -181,3 +181,9 @@
 - Indicator hot reload now keeps the last valid indicator definition visible if a file breaks on reload (parity with strategies).
 - Fixed Strategy overlay renderer chunking logic and re-enabled overlay rendering behind `PYSUPERCHART_ENABLE_STRATEGY_OVERLAY=1` (default remains off while validating stability).
 - Extended headless CLI with a deterministic synthetic stress mode (`--stress-bars`) and optional persistence for large-run scale checks.
+
+## 0.8.3
+- Strategy run history now skips/loading blocks corrupt runs (verified via `verify_run`) to avoid showing partial results after crashes.
+- Strategy/indicator lists now surface hot-reload failures as "(stale)" entries with tooltips explaining the load error.
+- Repo-root CLI tooling now works without custom `PYTHONPATH` via lightweight `core/` and `indicators/` import shims.
+- Expanded offline `unittest` coverage for range-loader error formatting, indicator last-good behavior, and StrategyStore verification.
