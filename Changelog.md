@@ -187,3 +187,9 @@
 - Strategy/indicator lists now surface hot-reload failures as "(stale)" entries with tooltips explaining the load error.
 - Repo-root CLI tooling now works without custom `PYTHONPATH` via lightweight `core/` and `indicators/` import shims.
 - Expanded offline `unittest` coverage for range-loader error formatting, indicator last-good behavior, and StrategyStore verification.
+
+## 0.8.4
+- Added rolling perf budget summaries and chunk/item counts to the debug dock to make CPU cost centers obvious at a glance.
+- Updated docs to match implemented reality (V1 base backtesting exists; overlays are env-gated).
+- Stopped tracking local OHLCV cache DB and ignored SQLite WAL/SHM + runtime logs to keep `git status` clean after running the app.
+- Added a minimal strategy overlay renderer smoke test to prevent paint-path regressions.

@@ -751,6 +751,14 @@ class ChartView(QWidget):
         self._strategy_finish_in_progress = False
         self._last_visible_bars = 0
 
+        # Rolling perf window (event-based) for debug dock budgeting.
+        self._perf_window_s = 5.0
+        self._perf_samples: Dict[str, List[Tuple[float, int]]] = {}
+        self._indicator_compute_last_ts: Optional[float] = None
+        self._candle_normalize_last_ts: Optional[float] = None
+        self._backfill_decision_last_ts: Optional[float] = None
+        self._volume_prep_last_seen_ts: Optional[float] = None
+
     def _setup_indicator_system(self) -> None:
         self._load_indicator_definitions()
         self._load_indicator_instances()
@@ -819,6 +827,8 @@ class ChartView(QWidget):
             return
         if hasattr(self, "_indicator_compute_last_start"):
             self._indicator_compute_last_ms = int((time.time() - self._indicator_compute_last_start) * 1000)
+            self._indicator_compute_last_ts = time.time()
+            self._perf_note("indicator_compute", self._indicator_compute_last_ms)
         for result in results:
             instance_id = str(result.get("instance_id"))
             output = result.get("output") or {}
@@ -2379,6 +2389,8 @@ class ChartView(QWidget):
             return
         if hasattr(self, "_candle_normalize_last_start"):
             self._candle_normalize_last_ms = int((time.time() - self._candle_normalize_last_start) * 1000)
+            self._candle_normalize_last_ts = time.time()
+            self._perf_note("candle_normalize", self._candle_normalize_last_ms)
         try:
             auto_range = bool(auto_range_flag)
             merge_info = self._candle_normalize_merge.pop(seq, None)
@@ -2707,6 +2719,8 @@ class ChartView(QWidget):
     def _on_backfill_decision(self, result: dict) -> None:
         if hasattr(self, "_backfill_decision_last_start"):
             self._backfill_decision_last_ms = int((time.time() - self._backfill_decision_last_start) * 1000)
+            self._backfill_decision_last_ts = time.time()
+            self._perf_note("backfill_decision", self._backfill_decision_last_ms)
         action = result.get("action")
         if action in ("left", "right"):
             self._backfill_pending = True
@@ -2808,6 +2822,32 @@ class ChartView(QWidget):
             pass
         self._emit_debug_state()
 
+    def _perf_note(self, key: str, ms: int) -> None:
+        try:
+            now = time.time()
+            buf = self._perf_samples.setdefault(key, [])
+            buf.append((now, int(ms)))
+            cutoff = now - float(self._perf_window_s)
+            while buf and buf[0][0] < cutoff:
+                buf.pop(0)
+        except Exception:
+            pass
+
+    def _perf_summary(self, key: str) -> tuple[float, int, int]:
+        buf = self._perf_samples.get(key) or []
+        if not buf:
+            return 0.0, 0, 0
+        vals = [v for _, v in buf]
+        try:
+            avg = float(sum(vals)) / float(len(vals)) if vals else 0.0
+        except Exception:
+            avg = 0.0
+        try:
+            mx = int(max(vals)) if vals else 0
+        except Exception:
+            mx = 0
+        return avg, mx, int(len(vals))
+
     def _emit_debug_state(self) -> None:
         if self.debug_sink is None:
             return
@@ -2879,7 +2919,50 @@ class ChartView(QWidget):
         lines.append(f'Indicator compute: {self._indicator_compute_last_ms} ms')
         lines.append(f'Candle normalize: {self._candle_normalize_last_ms} ms')
         lines.append(f'Backfill decision: {self._backfill_decision_last_ms} ms')
-        lines.append(f'Volume prep: {self.candles.get_volume_worker_ms()} ms')
+        vol_ms, vol_update_ts = self.candles.get_volume_prep_stats()
+        lines.append(f'Volume prep: {vol_ms} ms')
+        if vol_update_ts is not None and vol_update_ts != self._volume_prep_last_seen_ts:
+            self._volume_prep_last_seen_ts = vol_update_ts
+            self._perf_note("volume_prep", int(vol_ms))
+
+        ind_avg, ind_max, ind_n = self._perf_summary("indicator_compute")
+        norm_avg, norm_max, norm_n = self._perf_summary("candle_normalize")
+        back_avg, back_max, back_n = self._perf_summary("backfill_decision")
+        vol_avg, vol_max, vol_n = self._perf_summary("volume_prep")
+        lines.append(
+            "Perf budget (5s avg/max, n): "
+            f"ind={ind_avg:.0f}/{ind_max} ({ind_n}) | "
+            f"norm={norm_avg:.0f}/{norm_max} ({norm_n}) | "
+            f"backfill={back_avg:.0f}/{back_max} ({back_n}) | "
+            f"vol={vol_avg:.0f}/{vol_max} ({vol_n})"
+        )
+
+        try:
+            total_instances = len(self._indicator_instances)
+            active_instances = sum(1 for inst in self._indicator_instances if inst.get("visible", True) is not False)
+        except Exception:
+            total_instances = 0
+            active_instances = 0
+        try:
+            per_pane = {pane_id: len(getattr(r, "_items", {}) or {}) for pane_id, r in self._indicator_renderers.items()}
+            total_items = sum(per_pane.values())
+        except Exception:
+            per_pane = {}
+            total_items = 0
+        try:
+            candle_body_chunks, candle_line_chunks, candle_chunk_size = self.candles.get_candle_chunk_stats()
+            vol_chunks, vol_chunk_size = self.candles.get_volume_chunk_stats()
+        except Exception:
+            candle_body_chunks, candle_line_chunks, candle_chunk_size = 0, 0, 0
+            vol_chunks, vol_chunk_size = 0, 0
+        lines.append(
+            f"Indicator items: {total_items} ({active_instances}/{total_instances} active) | "
+            f"Per-pane: {per_pane or 'n/a'}"
+        )
+        lines.append(
+            f"Chunks: candles body={candle_body_chunks} line={candle_line_chunks} (size {candle_chunk_size}) | "
+            f"volume={vol_chunks} (size {vol_chunk_size})"
+        )
         lines.append(f'Worker running: {bool(self._worker and self._worker.isRunning())}')
         lines.append(f'Window pending: {self._backfill_pending}')
         lines.append(f'Live kline: {bool(self._kline_worker and self._kline_worker.isRunning())}')

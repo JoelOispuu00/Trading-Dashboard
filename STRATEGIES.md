@@ -1,14 +1,14 @@
-﻿# V2 Strategy + Backtesting Execution Plan (Desktop‑Only, Local‑First)
+﻿# V1 Strategy + Backtesting Execution Plan (Desktop‑Only, Local‑First)
 
-This document is the **V2-only** architecture and execution plan for adding **strategy management + deterministic backtesting** to the existing local Python/PyQt6/pyqtgraph desktop charting application.
+This document is the **V1-only** architecture and execution plan for adding **strategy management + deterministic backtesting** to the existing local Python/PyQt6/pyqtgraph desktop charting application.
 
-It rewrites the raw `strategies.md` input into explicit V2 tasks, removes ambiguity, **fixes mismatches against the current codebase**, and excludes anything not required for V2.
+It rewrites the raw `strategies.md` input into explicit V1 tasks, removes ambiguity, **fixes mismatches against the current codebase**, and excludes anything not required for V1.
 
 ---
 
-## 0) V2 Scope Summary
+## 0) V1 Scope Summary
 
-### What V2 delivers
+### What V1 delivers
 
 #### Local Python strategy discovery + hot reload
 - Strategies are single `.py` files on disk.
@@ -18,7 +18,7 @@ It rewrites the raw `strategies.md` input into explicit V2 tasks, removes ambigu
 #### Deterministic single-symbol backtesting
 - Uses existing OHLCV cache in `app/data/ohlcv.sqlite`.
 - Optional backfill uses existing Binance REST fetch pipeline.
-- Reproducible fill model with **market orders only** (V2).
+- Reproducible fill model with **market orders only** (V1).
 - Deterministic “range loader” guarantees complete `[start‑warmup, end]` coverage or hard fail.
 
 #### Portfolio + equity curve + trade list
@@ -31,7 +31,7 @@ It rewrites the raw `strategies.md` input into explicit V2 tasks, removes ambigu
 - Report dock: equity curve + trade list + stats.
 - Chart overlays: entry/exit markers rendered on price pane, positioned by **timestamp** and mapped to chart **index-x** at render time.
 
-### What V2 explicitly does NOT deliver
+### What V1 explicitly does NOT deliver
 Everything in the raw strategy doc that goes beyond the minimal backtester and UI:
 - Paper trading mode (live feed + simulated fills)
 - Live execution adapters (real broker/exchange routing)
@@ -55,7 +55,7 @@ Everything in the raw strategy doc that goes beyond the minimal backtester and U
 - Chart x-axis is **index-based** internally (bars indexed), while bars include timestamps.
 - Time is epoch ms; timezone-agnostic.
 
-### V2 design implications
+### V1 design implications
 - Backtest must run entirely local in-process, avoid freezing UI (worker thread).
 - Strategies must reuse existing NumPy bar normalization patterns (same bar indexing/timestamps as chart & indicators).
 - Overlay rendering must avoid performance regressions: chunk caching, LOD, and invalidation keyed on bar-data changes.
@@ -63,7 +63,7 @@ Everything in the raw strategy doc that goes beyond the minimal backtester and U
 ### 1.1 Data loading API mismatch (ChartView windowed loads vs backtest range requirement)
 **Mismatch:** The plan must not rely on `data_fetch.load_window` for backtests. Current fetch/backfill is UI/window-driven. Backtests require a deterministic guarantee: load full `[start‑warmup, end]` span or hard fail.
 
-**V2 fix:** Add a dedicated deterministic API in `app/core/data_fetch.py`:
+**V1 fix:** Add a dedicated deterministic API in `app/core/data_fetch.py`:
 
 - `load_range_bars(symbol, timeframe, start_ts, end_ts, *, allow_fetch=True) -> np.ndarray`
 
@@ -76,7 +76,7 @@ Behavior:
 ### 1.2 Timestamp vs index axis (overlay stability across window loads)
 **Mismatch:** Chart renders in index-x; strategy results are timestamp-addressed; there’s no explicit public timestamp→index API.
 
-**V2 fix:** Make **timestamps canonical** for strategy/backtest artifacts, and add mapping to chart:
+**V1 fix:** Make **timestamps canonical** for strategy/backtest artifacts, and add mapping to chart:
 - Add `index_for_ts(ts_ms) -> int | None` to `CandlestickChart` (or its data model), implemented via `np.searchsorted(time_array, ts_ms)` + bounds check.
 - Invalidate overlay caches whenever chart bars change.
 
@@ -85,7 +85,7 @@ Overlays store `{ts, price, kind, side, label}` and compute index at render time
 ### 1.3 Indicator system coupling (NaNs and determinism)
 **Mismatch:** Helper functions may produce NaNs and mixed float values at series start.
 
-**V2 fix:** Accept NaNs as deterministic outputs and require strategies to guard warmup:
+**V1 fix:** Accept NaNs as deterministic outputs and require strategies to guard warmup:
 - `ctx.ind` wraps `app/indicators/helpers.py` as pure vectorized transforms.
 - NaNs are allowed; no special casing in engine.
 - `ctx.ind` memoizes outputs per run to avoid recompute inside `on_bar`.
@@ -93,19 +93,19 @@ Overlays store `{ts, price, kind, side, label}` and compute index at render time
 ### 1.4 SQLite storage operations (second DB)
 **Mismatch:** `app/data/` is ignored in git; DB files are runtime artifacts.
 
-**V2 fix:** Use `app/data/strategy.sqlite` and create it **lazily on first run** (not on startup). WAL mode enabled.
+**V1 fix:** Use `app/data/strategy.sqlite` and create it **lazily on first run** (not on startup). WAL mode enabled.
 
 ### 1.5 Hot‑reload infra duplication
 **Mismatch:** App already has hot reload infrastructure (`hot_reload.py`). Creating a separate watcher duplicates logic.
 
-**V2 fix:** Reuse existing hot reload watcher infra for strategies:
+**V1 fix:** Reuse existing hot reload watcher infra for strategies:
 - Watch: `app/strategies/builtins/*.py`, `app/strategies/custom/*.py`.
 - StrategyRegistry registers callbacks and debouncing via shared infra.
 
 ### 1.6 UI docking + settings persistence
 **Mismatch:** Docks should persist across sessions via existing QSettings layout restore.
 
-**V2 fix:** Give new docks stable objectNames:
+**V1 fix:** Give new docks stable objectNames:
 - `StrategyPanelDock`
 - `StrategyReportDock`
 and let existing layout persistence handle them in the same QSettings namespace used by the app.
@@ -113,29 +113,29 @@ and let existing layout persistence handle them in the same QSettings namespace 
 ### 1.7 “Visible range” run config must be snapshot-based
 **Mismatch:** Visible range is volatile during window loads.
 
-**V2 fix:** Define “use visible range” as:
+**V1 fix:** Define “use visible range” as:
 - Snapshot `(ts_min, ts_max)` at Run-click time via `ChartView.get_visible_ts_range_snapshot()`.
 - Backtest uses that snapshot only.
 
 ### 1.8 Equity curve x-link mismatch
 **Mismatch:** `setXLink` assumes same x coordinate system; price chart uses index-x; equity should be timestamp-x.
 
-**V2 fix:** Equity curve uses **timestamp-x** and is synced manually:
+**V1 fix:** Equity curve uses **timestamp-x** and is synced manually:
 - ChartView emits `visible_ts_range_changed(ts_min, ts_max)`.
 - Equity widget sets its x-range accordingly.
 
 ### 1.9 Strategy overlay rendering integration point
 **Mismatch:** No generic overlay renderer API beyond indicators/candles.
 
-**V2 fix:** Add `StrategyOverlayRenderer` (`app/ui/charts/strategy_overlay.py`) with:
+**V1 fix:** Add `StrategyOverlayRenderer` (`app/ui/charts/strategy_overlay.py`) with:
 - chunked QPicture rendering
 - caching keyed by `(run_id, bars_key, visible_range_bucket, lod_level)`
 - timestamp→index mapping via `index_for_ts()`
 
 ---
 
-## 2) V2 Non‑Goals and Explicit Deferrals
-These items are excluded from V2 even if described in the raw strategy doc:
+## 2) V1 Non‑Goals and Explicit Deferrals
+These items are excluded from V1 even if described in the raw strategy doc:
 
 ### Execution modes excluded
 - Paper trading mode (live data + simulated fills)
@@ -159,18 +159,18 @@ These items are excluded from V2 even if described in the raw strategy doc:
 - Trade prints for market impact
 - Funding rate polling/refresh
 
-V2 focuses on a simple deterministic bar-based backtest sufficient to validate strategies and render outcomes on the chart.
+V1 focuses on a simple deterministic bar-based backtest sufficient to validate strategies and render outcomes on the chart.
 
 ---
 
-## 3) V2 Decisions to Resolve Ambiguity (Locked)
+## 3) V1 Decisions to Resolve Ambiguity (Locked)
 
-### 3.1 Orders supported in V2
+### 3.1 Orders supported in V1
 - Market orders only:
   - `ctx.buy(size)` and `ctx.sell(size)` enqueue market orders.
   - `ctx.flatten()` closes the current position.
 - No limit/stop/stop-limit; no TIF.
-- `ctx.cancel(order_id)` is **not supported** in V2 (no-op + warning).
+- `ctx.cancel(order_id)` is **not supported** in V1 (no-op + warning).
 
 ### 3.2 Fill model (deterministic)
 - Signal on bar close; fill on next bar open:
@@ -185,7 +185,7 @@ V2 focuses on a simple deterministic bar-based backtest sufficient to validate s
 - Commission model: fixed bps of notional
   - `fee = abs(size) * fill_price * commission_bps/10000`
 
-### 3.4 Position model (V2 simplification)
+### 3.4 Position model (V1 simplification)
 - One net position at a time:
   - flat → long → flat
   - flat → short → flat
@@ -202,7 +202,7 @@ V2 focuses on a simple deterministic bar-based backtest sufficient to validate s
 
 ### 3.6 Strategy state persistence
 - `ctx.state` persists **during a run only**.
-- Not persisted across runs in V2.
+- Not persisted across runs in V1.
 
 ### 3.7 Logging granularity (and storage decision)
 Persist:
@@ -237,7 +237,7 @@ Warmup behavior:
 
 ---
 
-## 4) V2 File/Module Layout
+## 4) V1 File/Module Layout
 
 ### 4.1 Strategy source files (user-facing)
 ```
@@ -246,7 +246,7 @@ app/strategies/
   custom/              # user strategies (editable)
 ```
 
-### 4.2 Core engine (V2-only)
+### 4.2 Core engine (V1-only)
 ```
 app/core/strategies/
   registry.py          # discovery + hot reload + schema validation (reuse shared watcher)
@@ -260,10 +260,10 @@ app/core/strategies/
   store.py             # SQLite persistence for runs/orders/trades/equity/messages
 ```
 
-Excluded in V2:
+Excluded in V1:
 - `app/core/strategies/deep/*`
 
-### 4.3 UI (V2-only)
+### 4.3 UI (V1-only)
 ```
 app/ui/
   strategy_panel.py         # strategy list + param form + run controls
@@ -272,7 +272,7 @@ app/ui/
   charts/strategy_overlay.py  # chart overlay renderer (timestamp markers -> index-x)
 ```
 
-### 4.4 Required additions to existing app modules (V2)
+### 4.4 Required additions to existing app modules (V1)
 - `app/core/data_fetch.py`: add `load_range_bars(...)` for deterministic backtests.
 - `app/ui/charts/candlestick_chart.py` (or its data model): add `index_for_ts(ts_ms)` and invalidate overlay caches on bars updates.
 - `app/ui/chart_view.py`: add:
@@ -282,7 +282,7 @@ app/ui/
 
 ---
 
-## 5) Strategy Contract (V2)
+## 5) Strategy Contract (V1)
 
 ### 5.1 Required functions
 Each strategy is one `.py` file with:
@@ -295,8 +295,8 @@ Each strategy is one `.py` file with:
 - `on_trade(ctx, trade)`
 - `on_finish(ctx)`
 
-### 5.3 Schema format (V2 canonical)
-V2 supports input types: `int`, `float`, `bool`, `select`.
+### 5.3 Schema format (V1 canonical)
+V1 supports input types: `int`, `float`, `bool`, `select`.
 
 ```python
 def schema():
@@ -312,7 +312,7 @@ def schema():
     }
 ```
 
-### 5.4 Validation rules (V2)
+### 5.4 Validation rules (V1)
 - `id`: required, unique, `[a-z0-9_]+`
 - `name`: required
 - `inputs`: dict of input specs; each must include:
@@ -325,7 +325,7 @@ Invalid schema: registry reports error; last valid remains visible/selectable.
 
 ---
 
-## 6) Strategy Context API (ctx) — V2 Surface
+## 6) Strategy Context API (ctx) — V1 Surface
 
 ### 6.1 Data access (NumPy arrays)
 - `ctx.bars` → `np.ndarray` shape `(n, 6)` columns:
@@ -338,13 +338,13 @@ Invalid schema: registry reports error; last valid remains visible/selectable.
 - `ctx.ind` memoizes results by `(fn_name, args_signature, kwargs_signature)` per run.
 - NaNs are accepted and deterministic.
 
-### 6.3 Orders (V2)
+### 6.3 Orders (V1)
 - `ctx.buy(size)` → enqueue market buy (executed next bar open)
 - `ctx.sell(size)` → enqueue market sell (executed next bar open)
 - `ctx.flatten()` → enqueue close-position action (executed next bar open)
-- `ctx.cancel(order_id)` → not supported in V2 (warn + no-op)
+- `ctx.cancel(order_id)` → not supported in V1 (warn + no-op)
 
-### 6.4 Portfolio/position (V2)
+### 6.4 Portfolio/position (V1)
 - `ctx.position.size` (float; +long / -short / 0 flat)
 - `ctx.position.entry_price`
 - `ctx.position.unrealized_pnl`
@@ -360,29 +360,29 @@ Invalid schema: registry reports error; last valid remains visible/selectable.
   - stores in-memory for UI
   - persists to `strategy_messages` in SQLite
 
-### 6.6 Sizing helpers (V2 minimal)
+### 6.6 Sizing helpers (V1 minimal)
 - `ctx.size.fixed(units)` → returns units
 - `ctx.size.percent_equity(pct)` → returns units:
   - `units = (ctx.portfolio.equity * pct * leverage) / ctx.close[i]` (signal-time close)
-- Excluded: risk-based sizing in V2.
+- Excluded: risk-based sizing in V1.
 
 ---
 
-## 7) Backtesting Engine (V2)
+## 7) Backtesting Engine (V1)
 
 ### 7.1 Data pipeline (deterministic)
 Backtest runner uses:
 - `DataStore` (`app/core/data_store.py`) for cached OHLCV reads.
 - New deterministic loader: `data_fetch.load_range_bars(...)` for full coverage.
 
-V2 behavior:
+V1 behavior:
 - Load bars for:
   - `symbol`, `timeframe`, `(start_ts - warmup)`, `end_ts`
 - If coverage missing:
   - attempt backfill via existing REST provider
   - if still missing: **fail run** with explicit missing range
 
-### 7.2 Bar loop (V2 canonical)
+### 7.2 Bar loop (V1 canonical)
 Definitions:
 - `i` indexes current bar (signal bar).
 - fills happen on `i+1` open.
@@ -409,9 +409,9 @@ Pseudo-sequence:
 
 ### 7.3 End-of-run close convention (locked)
 - Close at last processed bar close, with slippage/fees applied using that close price.
-- This is the only fill-on-close behavior in V2.
+- This is the only fill-on-close behavior in V1.
 
-### 7.4 Determinism guardrails (V2)
+### 7.4 Determinism guardrails (V1)
 - No randomness.
 - Bars are fixed before simulation starts.
 - Use float64 NumPy; no display rounding in engine.
@@ -419,12 +419,12 @@ Pseudo-sequence:
 
 ---
 
-## 8) Persistence (SQLite) — V2
+## 8) Persistence (SQLite) — V1
 
 ### 8.1 Storage location
 - `app/data/strategy.sqlite` (WAL mode), created lazily on first run.
 
-### 8.2 Tables (V2 required)
+### 8.2 Tables (V1 required)
 
 **strategy_runs**
 - run_id TEXT PK
@@ -479,7 +479,7 @@ Pseudo-sequence:
 - position_size REAL
 - price REAL
 
-**strategy_messages** (**V2 locked**)
+**strategy_messages** (**V1 locked**)
 - id INTEGER PK AUTOINCREMENT
 - run_id TEXT
 - ts INTEGER
@@ -487,13 +487,13 @@ Pseudo-sequence:
 - message TEXT
 - bar_ts INTEGER NULL
 
-### 8.3 Indexes (V2)
+### 8.3 Indexes (V1)
 - strategy_equity(run_id, ts)
 - strategy_orders(run_id, submitted_ts)
 - strategy_trades(run_id, entry_ts)
 - strategy_messages(run_id, ts)
 
-### 8.4 Store API (V2)
+### 8.4 Store API (V1)
 `StrategyStore` in `app/core/strategies/store.py` provides:
 - create_run(...)
 - update_run_status(run_id, status, error_text=None)
@@ -505,7 +505,7 @@ Pseudo-sequence:
 
 ---
 
-## 9) Report & Overlay Schema (V2)
+## 9) Report & Overlay Schema (V1)
 
 ### 9.1 In-memory report object
 `StrategyReport` (in `report.py`) contains:
@@ -535,7 +535,7 @@ Interaction:
 
 ---
 
-## 10) UI Integration (V2)
+## 10) UI Integration (V1)
 
 ### 10.1 New docks/widgets
 StrategyPanel Dock (`app/ui/strategy_panel.py`):
@@ -562,7 +562,7 @@ Equity curve widget (`app/ui/strategy_equity.py`):
 Dock persistence:
 - set `objectName="StrategyPanelDock"` and `"StrategyReportDock"` so QSettings layout restore captures them.
 
-### 10.2 ChartView integration points (V2)
+### 10.2 ChartView integration points (V1)
 Modify `app/ui/chart_view.py` to:
 - Own a StrategyRegistry instance (or be able to access one owned by MainWindow).
 - Provide snapshot helper:
@@ -586,7 +586,7 @@ Backtest runs on worker thread (QThread/QRunnable):
 
 ---
 
-## 11) V2 Implementation Task Breakdown (Updated)
+## 11) V1 Implementation Task Breakdown (Updated)
 
 ### Task 1 — Deterministic range loader (required for correctness)
 Deliverables:
@@ -640,7 +640,7 @@ Files:
 Acceptance:
 - Engine and report share stable dataclasses.
 
-### Task 7 — Broker + portfolio primitives (V2-simple)
+### Task 7 — Broker + portfolio primitives (V1-simple)
 Files:
 - `app/core/strategies/broker.py`
 - `app/core/strategies/portfolio.py`
@@ -703,9 +703,9 @@ Acceptance:
 
 ---
 
-## 12) Definition of Done (V2)
+## 12) Definition of Done (V1)
 
-V2 is complete when:
+V1 is complete when:
 - Strategies can be added/edited locally and hot-reloaded.
 - Backtest runs deterministically using `load_range_bars()` or fails clearly.
 - Results appear in:
@@ -715,10 +715,17 @@ V2 is complete when:
 - UI stays responsive during backtests (worker thread).
 - Core behavior matches the locked decisions in §3.
 
+## V1 backtest semantics (implemented)
+- Fee accounting: `Trade.pnl` is net PnL after both entry and exit fees; `Trade.fee_total` includes entry + exit fees.
+- Forced close: end-of-run and cancel forced closes fill at bar close with side-aware slippage bps applied and commissions charged on that fill.
+- Warmup: `on_bar` runs during warmup to build state, but trading is disabled; `buy/sell/flatten` become no-ops and warn once per run per method.
+- Deterministic data coverage: backtests require complete `[start_ts - warmup, end_ts]` OHLCV coverage; missing ranges are fetched (if allowed) or the run hard-fails with explicit missing segments.
+- Strategy overlays: kept disabled until the RecursionError root cause is fixed.
+
 ---
 
-## 13) V3+ Deferred List (for clarity only; not to implement in V2)
-Do not implement in V2:
+## 13) V2+ Deferred List (for clarity only; not to implement in V1)
+Do not implement in V1:
 - Deep backtester modules and realistic order lifecycle
 - Limit/stop orders, partial fills
 - Paper/live execution modes
@@ -730,13 +737,13 @@ Do not implement in V2:
 
 ---
 
-## Appendix A — V2 Example Strategy (builtin)
+## Appendix A — V1 Example Strategy (builtin)
 
 ```python
 def schema():
     return {
         "id": "ema_cross",
-        "name": "EMA Cross (V2)",
+        "name": "EMA Cross (V1)",
         "inputs": {
             "fast": {"type": "int", "default": 12, "min": 1, "max": 200},
             "slow": {"type": "int", "default": 26, "min": 1, "max": 200},

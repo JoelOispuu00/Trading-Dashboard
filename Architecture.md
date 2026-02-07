@@ -2,7 +2,7 @@
 
 ## Scope (V1)
 - Desktop app using PyQt6 + pyqtgraph.
-- Charting + indicators only (no strategy execution or backtesting yet).
+- Charting + indicators, plus a V2-simple strategy runtime + deterministic backtesting (single-symbol, single-timeframe).
 - Primary chart type: candlestick. Renko to-do.
 - Indicators are hot-reloadable from a local folder.
 - Indicator errors surface in a dedicated error dock.
@@ -29,9 +29,8 @@ renders fast; background backfill extends older history in chunks while the
 chart remains usable.
 
 ## Future extensions (post-V1)
-- Strategy execution and backtesting.
-- Deep backtester (custom engine).
-- Strategy management (hot reload, params, execution logs).
+- Deep backtester (custom engine) and expanded order lifecycle realism.
+- Strategy management expansion (more strategies, richer config, diagnostics, run comparisons).
 - Broker/exchange live execution adapters.
 - Market scanner module.
 - Drawing tools (trendlines, annotations).
@@ -44,11 +43,15 @@ chart remains usable.
   - `indicator_panel.py`: indicator selection + params
   - `error_dock.py`: error display + history
   - `debug_dock.py`: live metrics
+  - `strategy_panel.py`: strategy selection + params + run controls
+  - `strategy_report.py`: stats + trades table + run history
+  - `strategy_equity.py`: equity curve widget
 - `app/ui/charts/`: chart renderers + helpers
   - `candlestick_chart.py`: candlestick renderer
   - `renko_chart.py`: renko renderer (planned)
   - `line_chart.py`: line renderer (planned)
   - `volume_histogram.py`: volume overlay
+  - `strategy_overlay.py`: entry/exit markers (env-gated while stabilizing)
   - `performance.py`: visible-range + LOD helpers
 - `app/ui/theme/`: UI styling and theme tokens
   - `theme.py`: palette + style constants
@@ -60,6 +63,7 @@ chart remains usable.
   - `indicator_registry.py`: indicator discovery + schema
   - `hot_reload.py`: file watcher + debounce
   - `schema.py`: indicator schema types/validation
+  - `strategies/`: V2-simple strategy/backtest engine + persistence (`app/data/strategy.sqlite`)
   - `renko_builder.py`: Renko transform (planned)
 - `app/indicators/`: indicator modules
   - `builtins/`: shipped indicators

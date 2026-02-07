@@ -1,6 +1,12 @@
 __pycache__/
 *.pyc
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.db
+
+# Runtime logs / crash dumps
+*.log
+run.log
 exception.log
 faulthandler.log

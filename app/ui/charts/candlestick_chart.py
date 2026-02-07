@@ -886,6 +886,7 @@ class CandlestickChart:
             return
         if hasattr(self, "_volume_worker_last_start"):
             self._volume_worker_last_ms = int((time.time() - self._volume_worker_last_start) * 1000)
+            self._volume_worker_last_update_ts = time.time()
         self._last_volume_live_update_ms = int(time.time() * 1000)
         volume_color = QColor(self.base_color)
         bar_width = (self.timeframe_ms or 60_000) * 0.8
@@ -1642,6 +1643,35 @@ class CandlestickChart:
 
     def get_volume_worker_ms(self) -> int:
         return int(self._volume_worker_last_ms)
+
+    def get_volume_prep_stats(self) -> tuple[int, Optional[float]]:
+        # Used by ChartView debug metrics to build rolling perf windows without polling.
+        return int(self._volume_worker_last_ms), getattr(self, "_volume_worker_last_update_ts", None)
+
+    def get_candle_chunk_stats(self) -> tuple[int, int, int]:
+        """
+        Returns: (body_chunks, line_chunks, chunk_size).
+        """
+        try:
+            body = len(getattr(self.item, "_chunk_cache", {}) or {})
+            line = len(getattr(self.item, "_line_chunk_cache", {}) or {})
+            chunk_size = int(getattr(self.item, "_chunk_size", 0) or 0)
+            return body, line, chunk_size
+        except Exception:
+            return 0, 0, 0
+
+    def get_volume_chunk_stats(self) -> tuple[int, int]:
+        """
+        Returns: (chunks, chunk_size).
+        """
+        try:
+            if isinstance(self.volume_item, VolumeHistogramItem):
+                chunks = len(getattr(self.volume_item, "_chunk_cache", {}) or {})
+                chunk_size = int(getattr(self.volume_item, "_chunk_size", 0) or 0)
+                return chunks, chunk_size
+        except Exception:
+            pass
+        return 0, 0
 
     def _index_for_time(self, ts_ms: float) -> Optional[int]:
         if not self._ts_cache:

@@ -1,5 +1,6 @@
 import sqlite3
-from typing import Iterable, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Iterable, Iterator, List, Optional, Tuple
 
 
 class DataStore:
@@ -7,11 +8,27 @@ class DataStore:
         self.db_path = db_path
         self._ensure_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        # sqlite3.Connection used as a context manager commits/rolls back, but does not close.
+        # Always close connections to avoid file handle leaks (esp. in tests and on Windows).
         conn = sqlite3.connect(self.db_path)
-        conn.execute('PRAGMA journal_mode=WAL;')
-        conn.execute('PRAGMA synchronous=NORMAL;')
-        return conn
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
